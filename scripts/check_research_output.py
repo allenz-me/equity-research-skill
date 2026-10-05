@@ -283,9 +283,22 @@ def check_report(
     issues: List[Issue],
     industries: Optional[Sequence[str]] = None,
     language: str = "auto",
+    scope: str = "deep",
 ) -> None:
     text = load_text(path)
     lower = text.lower()
+
+    if scope != "deep":
+        if language != "auto" or detect_report_language(text):
+            check_language_consistency(text, language, path, issues)
+        if scope == "focused":
+            if not has_any(text, SOURCE_MARKERS) and not re.search(r"https?://", text):
+                add(issues, "P1", "REPORT_NO_SOURCE_SECTION", "专题分析未发现来源说明或链接。", file=path)
+            if not re.search(r"20\d{2}[-年/.]\d{1,2}", text):
+                add(issues, "P2", "REPORT_NO_TIMESTAMP", "专题分析未发现数据日期或时间戳。", file=path)
+        check_model_report_markers(text, assumptions, path, issues)
+        check_valuation_labels(text, assumptions, path, issues)
+        return
 
     check_language_consistency(text, language, path, issues)
     check_industry_requirements(text, industries, path, issues)
@@ -298,14 +311,7 @@ def check_report(
         add(issues, "P3", "REPORT_NO_MISSING_DATA_MARKER", "报告未出现缺失数据标记（如“未获取到”或“Not obtained”）；若确无缺失数据可忽略。", file=path)
     if not has_any(text, JUDGMENT_MARKERS):
         add(issues, "P2", "REPORT_NO_JUDGMENT_MARKER", "报告未显式标注判断（如“我的判断”或“My view”），事实与判断可能混在一起。", file=path)
-    if "scripts/dcf.py" not in text and "dcf.py" not in lower:
-        add(issues, "P2", "REPORT_NO_DCF_SCRIPT_EVIDENCE", "报告未说明 DCF/EPV 由脚本执行。", file=path)
-    if "反向 dcf" not in lower and "反向DCF" not in text and "reverse dcf" not in lower:
-        add(issues, "P2", "REPORT_NO_REVERSE_DCF", "报告未发现反向 DCF 框架。", file=path)
-    if "情景" not in text and "scenario" not in lower:
-        add(issues, "P2", "REPORT_NO_SCENARIO_VALUATION", "报告未发现情景估值或概率加权讨论。", file=path)
-    if "epv" not in lower and "盈利能力价值" not in text and "三要素" not in text:
-        add(issues, "P2", "REPORT_NO_EPV", "报告未发现 EPV/三要素估值交叉验证。", file=path)
+    check_model_report_markers(text, assumptions, path, issues)
     if not has_any(text, ["预测登记", "预测与验证", "forecast register", "forecast tracking"]):
         add(issues, "P2", "REPORT_NO_FORECAST_REGISTER", "报告未发现带验证期限的预测登记。", file=path)
     if not has_any(text, ["验证日期", "验证时点", "validation date", "review date"]):
@@ -368,6 +374,27 @@ def check_report(
             file=path,
         )
 
+    check_valuation_labels(text, assumptions, path, issues)
+
+
+def check_model_report_markers(text: str, assumptions: Optional[Dict], path: str, issues: List[Issue]) -> None:
+    """Only inspect valuation methods actually supplied; methods are not a quota."""
+    if not assumptions:
+        return
+    models = [name for name in ("scenarios", "epv", "eva", "reverse", "pvgo", "montecarlo") if assumptions.get(name)]
+    if models and "dcf.py" not in text.lower():
+        add(issues, "P2", "REPORT_NO_DCF_SCRIPT_EVIDENCE", "报告未说明所用估值由脚本执行。", file=path)
+    markers = {
+        "scenarios": ("REPORT_NO_SCENARIO_VALUATION", ["情景", "scenario"]),
+        "reverse": ("REPORT_NO_REVERSE_DCF", ["反向 dcf", "反向dcf", "reverse dcf"]),
+        "epv": ("REPORT_NO_EPV", ["epv", "盈利能力价值", "三要素"]),
+    }
+    for model, (code, terms) in markers.items():
+        if model in models and not has_any(text, terms):
+            add(issues, "P2", code, f"报告未解释已使用的 {model} 估值结果。", file=path)
+
+
+def check_valuation_labels(text: str, assumptions: Optional[Dict], path: str, issues: List[Issue]) -> None:
     if assumptions:
         price = parse_number(assumptions.get("price"))
         lo = parse_number(assumptions.get("range_low"))
@@ -386,98 +413,188 @@ def check_report(
                 )
 
 
-def check_assumptions(path: str, issues: List[Issue]) -> Dict:
+def check_assumptions(path: str, issues: List[Issue], require_review: bool = False) -> Dict:
     cfg = load_json(path)
-    price = parse_number(cfg.get("price"))
-    shares = parse_number(cfg.get("shares"))
-    wacc = parse_number(cfg.get("wacc"))
-    g = parse_number(cfg.get("terminal_g"))
-    lo = parse_number(cfg.get("range_low"))
-    hi = parse_number(cfg.get("range_high"))
+    if not isinstance(cfg, dict):
+        add(issues, "P1", "ASSUMPTION_CONFIG_INVALID", "估值假设必须是 JSON 对象。", file=path)
+        return {}
+    for name in ("reverse", "montecarlo", "eva", "epv", "pvgo"):
+        if cfg.get(name) is not None and not isinstance(cfg[name], dict):
+            add(issues, "P1", "ASSUMPTION_MODEL_INVALID", f"{name} 必须是对象。", file=path)
+            return cfg
+    if not isinstance(cfg.get("scenarios", []), list) or any(not isinstance(sc, dict) for sc in cfg.get("scenarios", [])):
+        add(issues, "P1", "ASSUMPTION_MODEL_INVALID", "scenarios 必须是情景对象数组。", file=path)
+        return cfg
 
-    for key, value in [("price", price), ("shares", shares), ("wacc", wacc), ("terminal_g", g)]:
-        if value is None:
-            add(issues, "P2", "ASSUMPTION_MISSING_CORE_FIELD", f"估值假设缺少核心字段 `{key}`。", file=path)
+    def numeric(block, key, context, required=False, positive=False):
+        value = block.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            if required or key in block:
+                add(issues, "P1", "ASSUMPTION_INVALID_NUMBER", f"{context}.{key} 必须是有限 JSON 数值，不能是字符串或布尔值。", file=path)
+            return None
+        if positive and value <= 0:
+            add(issues, "P0", "ASSUMPTION_NON_POSITIVE", f"{context}.{key} 必须为正数。", file=path)
+        return value
 
-    if wacc is not None and g is not None:
-        if wacc <= g:
-            add(issues, "P0", "DCF_WACC_NOT_ABOVE_G", "WACC 必须大于永续增长率 g。", f"wacc={wacc}, terminal_g={g}", path)
-        if not 0.03 <= wacc <= 0.20:
-            add(issues, "P2", "DCF_WACC_UNUSUAL", "WACC 超出常见区间，请确认口径。", f"wacc={pct(wacc)}", path)
-        if not -0.02 <= g <= 0.05:
-            add(issues, "P2", "DCF_TERMINAL_G_UNUSUAL", "永续增长率 g 超出常见区间，请确认长期名义增长锚。", f"g={pct(g)}", path)
+    def rate_basis(block, expected, context):
+        actual = str(block.get("discount_rate_basis", expected)).upper()
+        if actual == "COST_OF_EQUITY":
+            actual = "COE"
+        if actual != expected:
+            add(issues, "P1", "VALUATION_RATE_BASIS_MISMATCH", f"{context} 的折现率口径应为 {expected}。", file=path)
 
-    if shares is not None and shares <= 0:
-        add(issues, "P0", "SHARES_NON_POSITIVE", "股本必须为正数。", f"shares={shares}", path)
-    if lo is not None and hi is not None:
-        if lo > hi:
-            add(issues, "P0", "VALUATION_RANGE_INVERTED", "综合估值区间下限高于上限。", f"range_low={lo}, range_high={hi}", path)
+    def cash_bridge(block, context):
+        cash = numeric(block, "excess_cash", context)
+        if cash is not None and cash != 0:
+            add(issues, "P1", "VALUATION_CASH_DOUBLE_COUNT", f"{context}: net_debt 已扣非经营性现金，不得再加 excess_cash。", file=path)
+        numeric(block, "net_debt", context)
 
-    scenarios = cfg.get("scenarios") or []
-    if not scenarios:
-        add(issues, "P1", "DCF_NO_SCENARIOS", "估值假设未包含 scenarios，无法检查三情景概率加权 DCF。", file=path)
+    def firm_basis(block, context):
+        rate_basis(block, "WACC", context)
+        if str(block.get("cashflow_basis", "FCFF")).upper() != "FCFF":
+            add(issues, "P1", "VALUATION_CASHFLOW_BASIS_MISMATCH", f"{context} 仅支持 FCFF / WACC 企业估值。", file=path)
+        if str(block.get("valuation_basis", "firm")).lower() not in {"firm", "enterprise"}:
+            add(issues, "P1", "VALUATION_CASHFLOW_BASIS_MISMATCH", f"{context} 必须采用企业价值口径。", file=path)
+        if str(block.get("earnings_basis", "NOPAT")).upper() != "NOPAT":
+            add(issues, "P1", "VALUATION_EARNINGS_BASIS_MISMATCH", f"{context} 必须采用 NOPAT 口径。", file=path)
+        cash_bridge(block, context)
+
+    def equity_basis(block, context):
+        rate_basis(block, "COE", context)
+        if str(block.get("cashflow_basis", "FCFE")).upper() != "FCFE" or str(block.get("valuation_basis", "equity")).lower() != "equity":
+            add(issues, "P1", "VALUATION_CASHFLOW_BASIS_MISMATCH", f"{context} 必须采用股权口径。", file=path)
+        cash_bridge(block, context)
+
+    def discount_pair(rate, growth, context):
+        if rate is not None and growth is not None and rate <= growth:
+            add(issues, "P0", "DCF_WACC_NOT_ABOVE_G", f"{context}: 折现率必须大于永续增长率。", file=path)
+
+    models = {name: cfg.get(name) for name in ("scenarios", "reverse", "montecarlo", "eva", "epv", "pvgo")}
+    uses_dcf = bool(models["scenarios"]) or models["reverse"] is not None
+    mc = models["montecarlo"] or {}
+    eva = models["eva"] or {}
+    uses_eva, uses_mc = models["eva"] is not None, models["montecarlo"] is not None
+    uses_firm = uses_dcf or uses_mc or uses_eva
+    needs_wacc = uses_dcf or (uses_eva and "wacc" not in eva) or (uses_mc and ("wacc_low" not in mc or "wacc_high" not in mc))
+    needs_g = uses_dcf or (uses_mc and "terminal_g" not in mc)
+    needs_shares = uses_dcf or uses_mc or (uses_eva and "shares" not in eva)
+    price = numeric(cfg, "price", "valuation", required=models["reverse"] is not None, positive=True)
+    shares = numeric(cfg, "shares", "valuation", required=needs_shares, positive=True)
+    wacc = numeric(cfg, "wacc", "valuation", required=needs_wacc, positive=True)
+    g = numeric(cfg, "terminal_g", "valuation", required=needs_g)
+    if uses_firm:
+        firm_basis(cfg, "valuation")
     else:
-        prob_sum = 0.0
-        seen = set()
-        for idx, sc in enumerate(scenarios):
-            name = str(sc.get("name") or f"scenario_{idx}")
-            name_key = norm_key(name)
-            if name in seen:
-                add(issues, "P2", "DCF_DUPLICATE_SCENARIO", "情景名称重复。", name, path)
-            seen.add(name)
-            prob = parse_number(sc.get("prob"))
-            if prob is None:
-                add(issues, "P1", "DCF_SCENARIO_MISSING_PROB", "情景缺少概率。", name, path)
+        cash_bridge(cfg, "valuation")
+    if uses_dcf:
+        discount_pair(wacc, g, "DCF")
+    if wacc is not None and not 0.03 <= wacc <= 0.20:
+        add(issues, "P2", "DCF_WACC_UNUSUAL", "WACC 超出常见区间，请确认口径。", file=path)
+    if g is not None and not -0.02 <= g <= 0.05:
+        add(issues, "P2", "DCF_TERMINAL_G_UNUSUAL", "永续增长率超出常见区间，请确认长期增长锚。", file=path)
+    lo, hi = numeric(cfg, "range_low", "valuation"), numeric(cfg, "range_high", "valuation")
+    if lo is not None and hi is not None and lo > hi:
+        add(issues, "P0", "VALUATION_RANGE_INVERTED", "综合估值区间下限高于上限。", file=path)
+
+    scenarios = models["scenarios"] or []
+    prob_sum, decision_count, seen = 0.0, 0, set()
+    for idx, sc in enumerate(scenarios):
+        name = str(sc.get("name") or f"scenario_{idx}")
+        if name in seen:
+            add(issues, "P1", "DCF_DUPLICATE_SCENARIO", "情景名称重复。", name, path)
+        seen.add(name)
+        firm_basis(sc, name)
+        role = sc.get("role", "decision")
+        if role not in {"decision", "conditional"}:
+            add(issues, "P1", "DCF_SCENARIO_INVALID_ROLE", "情景 role 仅支持 decision 或 conditional。", name, path)
+        prob = numeric(sc, "prob", name, required=role == "decision")
+        if prob is not None and not 0 <= prob <= 1:
+            add(issues, "P0", "DCF_SCENARIO_PROB_OUT_OF_RANGE", "情景概率必须在 0 到 1 之间。", name, path)
+        if role == "decision":
+            decision_count += 1
+            prob_sum += prob or 0.0
+            if not str(sc.get("probability_rationale") or "").strip():
+                add(issues, "P2", "DCF_PROBABILITY_RATIONALE_MISSING", "参与决策加权的情景缺少 probability_rationale。", name, path)
+            if (sc.get("evidence_strength") or sc.get("evidence")) and not str(sc.get("evidence_update") or "").strip():
+                add(issues, "P2", "DCF_EVIDENCE_UPDATE_MISSING", "情景标注了证据强度，但未说明新证据如何影响概率；请填写 evidence_update。", name, path)
+        if "fcf" in sc:
+            arrays = [("fcf", sc["fcf"])]
+        else:
+            arrays = [("revenue", sc.get("revenue")), ("fcf_margin", sc.get("fcf_margin"))]
+            if all(isinstance(values, list) for _, values in arrays) and len(arrays[0][1]) != len(arrays[1][1]):
+                add(issues, "P0", "DCF_DRIVER_LENGTH_MISMATCH", "revenue 与 fcf_margin 长度不一致。", name, path)
+        for key, values in arrays:
+            if not isinstance(values, list) or not values:
+                add(issues, "P1", "DCF_SCENARIO_NO_FCF_OR_DRIVERS", "情景必须提供非空 fcf，或 revenue + fcf_margin。", name, path)
             else:
-                prob_sum += prob
-                if prob < 0 or prob > 1:
-                    add(issues, "P0", "DCF_SCENARIO_PROB_OUT_OF_RANGE", "情景概率必须在 0 到 1 之间。", f"{name}: prob={prob}", path)
-            evidence = str(sc.get("evidence_strength") or sc.get("evidence") or "").strip()
-            if not evidence:
-                add(issues, "P3", "DCF_SCENARIO_NO_EVIDENCE_STRENGTH", "情景未标注当前证据强度（弱/中/中强/强）。", name, path)
-            elif prob is not None and ("bull" in name_key or "bear" in name_key or "牛" in name or "熊" in name):
-                strong_evidence = evidence in {"中强", "强", "medium-high", "high", "strong"}
-                if strong_evidence and prob < 0.25:
-                    add(
-                        issues,
-                        "P2",
-                        "DCF_STRONG_EVIDENCE_LOW_PROBABILITY",
-                        "非基准情景已有中强/强证据，但概率仍低于 25%；需提高概率或解释为什么仍是尾部情景。",
-                        f"{name}: prob={prob}, evidence_strength={evidence}",
-                        path,
-                    )
-            if "fcf" not in sc:
-                revenue = sc.get("revenue")
-                margin = sc.get("fcf_margin")
-                if not isinstance(revenue, list) or not isinstance(margin, list):
-                    add(issues, "P1", "DCF_SCENARIO_NO_FCF_OR_DRIVERS", "情景必须提供 fcf，或 revenue + fcf_margin。", name, path)
-                elif len(revenue) != len(margin):
-                    add(issues, "P0", "DCF_DRIVER_LENGTH_MISMATCH", "revenue 与 fcf_margin 长度不一致。", f"{name}: revenue={len(revenue)}, fcf_margin={len(margin)}", path)
-            dilution = parse_number(sc.get("annual_dilution", 0))
-            if dilution is not None and (dilution < -0.20 or dilution > 0.20):
-                add(issues, "P2", "DCF_DILUTION_UNUSUAL", "年化股本变化超出常见区间，请确认。", f"{name}: annual_dilution={pct(dilution)}", path)
-        if abs(prob_sum - 1.0) > 0.005:
-            add(issues, "P1", "DCF_PROBABILITY_SUM_NOT_ONE", "情景概率之和不等于 1。", f"prob_sum={prob_sum:.4f}", path)
+                for index, value in enumerate(values):
+                    numeric({key: value}, key, f"{name}[{index}]", required=True)
+        dilution = numeric(sc, "annual_dilution", name)
+        if dilution is not None:
+            if dilution <= -1:
+                add(issues, "P0", "DCF_DILUTION_INVALID", "年化股本变化必须大于 -100%。", name, path)
+            elif not -0.20 <= dilution <= 0.20:
+                add(issues, "P2", "DCF_DILUTION_UNUSUAL", "年化股本变化超出常见区间，请确认。", name, path)
+    if decision_count and abs(prob_sum - 1.0) > 0.005:
+        add(issues, "P1", "DCF_PROBABILITY_SUM_NOT_ONE", "参与决策的情景概率之和不等于 1；conditional 不参与加权。", f"prob_sum={prob_sum:.4f}", path)
 
-    epv = cfg.get("epv")
-    if epv:
-        e = parse_number(epv.get("normalized_earnings"))
-        coc = parse_number(epv.get("coc"))
-        epv_shares = parse_number(epv.get("shares"))
-        if e is None or coc is None or epv_shares is None:
-            add(issues, "P1", "EPV_MISSING_CORE_FIELD", "EPV 块缺少 normalized_earnings / coc / shares。", file=path)
-        if coc is not None and coc <= 0:
-            add(issues, "P0", "EPV_COC_NON_POSITIVE", "EPV 资本成本必须为正。", f"coc={coc}", path)
+    epv = models["epv"]
+    if epv is not None:
+        numeric(epv, "normalized_earnings", "epv", required=True)
+        coc = numeric(epv, "coc", "epv", required=True, positive=True)
+        numeric(epv, "shares", "epv", required=True, positive=True)
+        basis = str(epv.get("earnings_basis", "NOPAT")).upper()
+        if basis not in {"NOPAT", "NET_INCOME", "NI"}:
+            add(issues, "P1", "EPV_EARNINGS_BASIS_INVALID", "EPV earnings_basis 仅支持 NOPAT / NET_INCOME / NI。", file=path)
+        if basis == "NOPAT":
+            firm_basis(epv, "epv")
+        else:
+            equity_basis(epv, "epv")
+        debt = epv.get("net_debt", 0)
+        if basis in {"NET_INCOME", "NI"} and isinstance(debt, (int, float)) and not isinstance(debt, bool) and math.isfinite(debt) and debt != 0:
+            add(issues, "P1", "EPV_EQUITY_DEBT_DOUBLE_COUNT", "净利润 EPV 已为权益价值，不得再次扣净债。", file=path)
         growth = epv.get("growth") or {}
-        gg = parse_number(growth.get("g"))
-        roiic = parse_number(growth.get("roiic"))
+        if not isinstance(growth, dict):
+            add(issues, "P1", "ASSUMPTION_MODEL_INVALID", "epv.growth 必须是对象。", file=path)
+            growth = {}
+        gg = numeric(growth, "g", "epv.growth")
+        roiic = numeric(growth, "roiic", "epv.growth")
         if gg is not None and coc is not None and gg >= coc:
-            add(issues, "P1", "EPV_G_NOT_BELOW_COC", "franchise 成长公式要求 g < 资本成本；否则需说明使用兜底简化式。", f"g={gg}, coc={coc}", path)
+            add(issues, "P1", "EPV_G_NOT_BELOW_COC", "franchise 成长公式要求 g < 资本成本。", file=path)
         if roiic is not None and coc is not None and roiic < coc:
-            add(issues, "P2", "EPV_ROIIC_BELOW_COC", "ROIIC 低于资本成本，增长可能毁灭价值。", f"roiic={pct(roiic)}, coc={pct(coc)}", path)
-    else:
-        add(issues, "P2", "EPV_BLOCK_MISSING", "估值假设未包含 epv 块，难以复核三要素/EPV 估值。", file=path)
+            add(issues, "P2", "EPV_ROIIC_BELOW_COC", "ROIIC 低于资本成本，增长可能毁灭价值。", file=path)
+    if uses_eva:
+        firm_basis(eva, "eva")
+        if str(eva.get("earnings_basis", "NOPAT")).upper() != "NOPAT":
+            add(issues, "P1", "EVA_EARNINGS_BASIS_INVALID", "EVA 仅支持 NOPAT 企业价值口径。", file=path)
+        numeric(eva, "invested_capital", "eva", required=True, positive=True)
+        numeric(eva, "nopat", "eva", required=True, positive=True)
+        numeric(eva, "wacc", "eva", positive=True)
+        numeric(eva, "shares", "eva", positive=True)
+    if models["reverse"] is not None:
+        firm_basis(models["reverse"], "reverse")
+    if uses_mc:
+        firm_basis(mc, "montecarlo")
+        mc_g = numeric(mc, "terminal_g", "montecarlo") if "terminal_g" in mc else g
+        low = numeric(mc, "wacc_low", "montecarlo", positive=True) if "wacc_low" in mc else (wacc - 0.01 if wacc is not None else None)
+        high = numeric(mc, "wacc_high", "montecarlo", positive=True) if "wacc_high" in mc else (wacc + 0.01 if wacc is not None else None)
+        discount_pair(low, mc_g, "montecarlo")
+        if low is not None and high is not None and low > high:
+            add(issues, "P1", "MC_WACC_RANGE_INVERTED", "蒙特卡洛 WACC 区间颠倒。", file=path)
+    pvgo = models["pvgo"]
+    if pvgo is not None:
+        numeric(pvgo, "r", "pvgo", required=True, positive=True)
+        numeric(pvgo, "earnings_ps", "pvgo", required=True)
+        equity_basis(pvgo, "pvgo")
+        if str(pvgo.get("earnings_basis", "NET_INCOME")).upper() not in {"NI", "NET_INCOME"}:
+            add(issues, "P1", "PVGO_EARNINGS_BASIS_INVALID", "PVGO 每股盈利必须采用净利润 / 权益成本口径。", file=path)
 
+    try:
+        from research_review import review_issues
+    except ModuleNotFoundError:
+        from scripts.research_review import review_issues
+    for issue in review_issues(cfg, require_review=require_review):
+        add(issues, issue["severity"], issue["code"], issue["message"], issue.get("detail", ""), path)
     return cfg
 
 
@@ -734,9 +851,9 @@ def run(args) -> int:
     issues: List[Issue] = []
     assumptions = None
     if args.assumptions:
-        assumptions = check_assumptions(args.assumptions, issues)
+        assumptions = check_assumptions(args.assumptions, issues, require_review=bool(args.report))
     if args.report:
-        check_report(args.report, assumptions, issues, args.industry, args.language)
+        check_report(args.report, assumptions, issues, args.industry, args.language, getattr(args, "scope", "deep"))
     if args.financials:
         check_financials(args.financials, issues)
     if not any([args.report, args.assumptions, args.financials]):
@@ -753,43 +870,18 @@ def write_demo_files(tmp: str) -> Tuple[str, str, str]:
     with open(report, "w", encoding="utf-8") as f:
         f.write(
             "# Demo（DEMO）个股投资研究报告\n\n"
-            "截至 2026-07-21，来源 Demo。我的判断：公司合理。\n\n"
+            "截至 2026-10-05，来源 Demo（仅合成示例）。我的判断：公司合理。\n\n"
             "行业附录: saas。\n\n"
             "| NRR | RPO | Rule of 40 |\n|---:|---:|---:|\n| 110% | 100 | 35% |\n\n"
             "> 内在价值判断：合理｜未来 1–3 个月市场交易方向：中性｜投资动作：观望。\n"
             "> 市场最可能先交易收入增速和 FCF 修复；上行证伪：增长显著加速；下行证伪：FCF 继续恶化。\n\n"
-            "估值由 scripts/dcf.py 运行，包含反向 DCF、情景 DCF、EPV / 盈利能力价值。\n\n"
+            "估值由 scripts/dcf.py 运行，以 EPV / 盈利能力价值为主，恢复假设见证据复核。\n\n"
             "预测登记：收入增长 10%–15%，验证日期 2026-10-31。\n\n"
-            "数据来源与时间戳：Demo 2026-07-21。未获取到：无。\n"
+            "数据来源与时间戳：Demo 2026-07-31。未获取到：无。\n"
         )
+    example_path = os.path.join(os.path.dirname(__file__), "..", "references", "research-review-example.json")
     with open(assumptions, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "price": 100.0,
-                "shares": 10.0,
-                "net_debt": 5.0,
-                "wacc": 0.09,
-                "terminal_g": 0.03,
-                "range_low": 80.0,
-                "range_high": 110.0,
-                "scenarios": [
-                    {"name": "bear", "prob": 0.3, "evidence_strength": "中", "revenue": [100, 105], "fcf_margin": [0.10, 0.11]},
-                    {"name": "base", "prob": 0.5, "evidence_strength": "中", "revenue": [100, 115], "fcf_margin": [0.12, 0.14]},
-                    {"name": "bull", "prob": 0.2, "evidence_strength": "弱", "revenue": [100, 130], "fcf_margin": [0.15, 0.18]},
-                ],
-                "epv": {
-                    "earnings_basis": "NOPAT",
-                    "normalized_earnings": 12.0,
-                    "coc": 0.09,
-                    "shares": 10.0,
-                    "net_debt": 5.0,
-                    "growth": {"g": 0.03, "roiic": 0.18},
-                },
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump(load_json(example_path), f, ensure_ascii=False, indent=2)
     with open(financials, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["period", "revenue", "gross_profit", "gross_margin", "cfo", "capex", "fcf", "fcf_margin"])
@@ -805,6 +897,7 @@ def main() -> None:
     ap.add_argument("--financials", help="历史/预测财务 CSV 路径")
     ap.add_argument("--industry", action="append", help="行业规则 slug，可重复或逗号分隔；传 auto 读取报告中的行业附录声明")
     ap.add_argument("--language", choices=["auto", "zh", "en"], default="auto", help="报告语言；auto 从标准标题判定")
+    ap.add_argument("--scope", choices=["direct", "focused", "deep"], default="deep", help="报告范围；只影响结构检查，不跳过已用估值及证据门槛")
     ap.add_argument("--list-industries", action="store_true", help="列出可用行业 slug 后退出")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出检查结果")
     ap.add_argument("--strict", action="store_true", help="P2 也返回非零退出码")

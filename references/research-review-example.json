@@ -1,0 +1,71 @@
+{
+  "price": 100,
+  "shares": 10,
+  "range_low": 80,
+  "range_high": 110,
+  "epv": {
+    "earnings_basis": "NOPAT",
+    "discount_rate_basis": "WACC",
+    "normalized_earnings": 90,
+    "coc": 0.09,
+    "shares": 10,
+    "net_debt": 0
+  },
+  "research_review": {
+    "version": 1,
+    "sources": [
+      {"id": "demo", "locator": "synthetic://illustrative-inputs-only-not-investment-evidence", "date": "2026-07-31"}
+    ],
+    "baseline": {
+      "earnings_basis": "NOPAT",
+      "currency": "USD",
+      "unit": "million",
+      "annual_period": "TTM ending 2026-06-30",
+      "annual_earnings": 60,
+      "source_ids": ["demo"],
+      "periods": [
+        {"period": "2026Q1", "start": "2026-01-01", "end": "2026-03-31", "prior_start": "2025-01-01", "prior_end": "2025-03-31", "actual": true, "comparable": true, "profit": 15, "prior_profit": 15, "source_ids": ["demo"]},
+        {"period": "2026Q2", "start": "2026-04-01", "end": "2026-06-30", "prior_start": "2025-04-01", "prior_end": "2025-06-30", "actual": true, "comparable": true, "profit": 15, "prior_profit": 15, "source_ids": ["demo"]}
+      ]
+    },
+    "claims": [
+      {
+        "id": "sustainable-earnings",
+        "kind": "earnings_recovery",
+        "parameter": "/epv/normalized_earnings",
+        "conservative_value": 60,
+        "assumed_value": 90,
+        "status": "supported",
+        "use": "decision",
+        "rationale": "Synthetic example: the target follows an observed recurring contract repricing and its cash collection; these are not real company facts.",
+        "counterevidence": "Synthetic example: the largest customer may not renew next year.",
+        "review_date": "2026-10-31",
+        "falsifier": "Recheck if renewal or cash collection fails to match the modeled uplift.",
+        "benchmark": {
+          "description": "Current annual sustainable earnings of 60, before the modeled recurring improvement.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": ["demo"]
+        },
+        "evidence": {
+          "business": [{"observation": "Synthetic recurring contracts support annual revenue of 600.", "source_ids": ["demo"]}],
+          "cash_flow": [{"observation": "Synthetic collections and maintenance capex support cash conversion of 90%.", "source_ids": ["demo"]}],
+          "competition": [{"observation": "Synthetic renewal data indicate no loss of customer share after repricing.", "source_ids": ["demo"]}]
+        }
+      }
+    ],
+    "earnings_bridge": {
+      "earnings_basis": "NOPAT",
+      "current_earnings": 60,
+      "current_revenue": 600,
+      "current_margin": 0.10,
+      "target_revenue": 600,
+      "target_margin": 0.15,
+      "adjustments": [],
+      "source_ids": ["demo"],
+      "maintenance_capex": {"value": 12, "explanation": "Synthetic maintenance spending; evaluated separately from the NOPAT bridge, not added back to earnings.", "source_ids": ["demo"]},
+      "cash_conversion": {"value": 0.9, "explanation": "Synthetic cash conversion after maintenance spending; this ratio is not itself an earnings adjustment.", "source_ids": ["demo"]}
+    },
+    "decision": {"action": "wait", "model_paths": ["/epv"]}
+  }
+}

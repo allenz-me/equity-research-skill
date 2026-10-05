@@ -1,7 +1,13 @@
 import importlib.util
+import argparse
+import contextlib
+import io
+import json
 import os
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -95,6 +101,147 @@ class FinancialHeaderTests(unittest.TestCase):
         self.assertNotIn("", aliases)
 
 
+class ValuationAssumptionTests(unittest.TestCase):
+    def check_config(self, cfg):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "valuation.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(cfg, handle)
+            issues = []
+            review = types.SimpleNamespace(review_issues=lambda cfg, require_review=False: [])
+            with mock.patch.dict("sys.modules", {"research_review": review}):
+                CHECKER.check_assumptions(path, issues)
+            return issues
+
+    @staticmethod
+    def scenario_config():
+        return {
+            "shares": 10, "wacc": 0.09, "terminal_g": 0.02,
+            "scenarios": [{"name": "base", "prob": 1, "fcf": [10, 11], "probability_rationale": "Current contracted demand supports this case."}],
+        }
+
+    def test_epv_only_needs_no_dcf_fields(self):
+        issues = self.check_config({"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": 0.12, "shares": 10}})
+        self.assertEqual([], issues)
+
+    def test_model_numeric_inputs_reject_strings_booleans_and_nonfinite_values(self):
+        for invalid in ("9%", "0.09", "1,000", True, False, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid=invalid):
+                cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": invalid, "shares": 10}}
+                issues = self.check_config(cfg)
+                self.assertTrue(any(issue.code == "ASSUMPTION_INVALID_NUMBER" and "epv.coc" in issue.message for issue in issues))
+
+    def test_model_vector_and_top_level_numbers_are_not_coerced(self):
+        for field in ("fcf", "prob", "wacc", "shares"):
+            with self.subTest(field=field):
+                cfg = self.scenario_config()
+                if field == "fcf":
+                    cfg["scenarios"][0]["fcf"] = [10, "11"]
+                elif field == "prob":
+                    cfg["scenarios"][0]["prob"] = "1"
+                else:
+                    cfg[field] = str(cfg[field])
+                issues = self.check_config(cfg)
+                self.assertTrue(any(issue.code == "ASSUMPTION_INVALID_NUMBER" and field in issue.message for issue in issues))
+
+    def test_explicit_empty_epv_is_not_silently_ignored(self):
+        issues = self.check_config({"epv": {}})
+        self.assertTrue(any(issue.code == "ASSUMPTION_INVALID_NUMBER" and "normalized_earnings" in issue.message for issue in issues))
+
+    def test_invalid_model_shapes_report_errors_without_crashing(self):
+        for cfg in ({"epv": []}, {"scenarios": {}}, {"scenarios": ["base"]}):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(["ASSUMPTION_MODEL_INVALID"], [issue.code for issue in self.check_config(cfg)])
+
+    def test_equity_epv_cannot_declare_fcff(self):
+        issues = self.check_config({"epv": {"earnings_basis": "NI", "cashflow_basis": "FCFF", "normalized_earnings": 60, "coc": 0.12, "shares": 10}})
+        self.assertTrue(any(issue.code == "VALUATION_CASHFLOW_BASIS_MISMATCH" for issue in issues))
+
+    def test_dcf_only_needs_no_epv(self):
+        self.assertEqual([], self.check_config(self.scenario_config()))
+
+    def test_distinct_firm_and_equity_rates_are_valid(self):
+        cfg = self.scenario_config()
+        cfg["epv"] = {"earnings_basis": "NET_INCOME", "normalized_earnings": 60, "coc": 0.12, "shares": 10, "discount_rate_basis": "COE"}
+        self.assertEqual([], self.check_config(cfg))
+
+    def test_wrong_equity_rate_basis_is_rejected(self):
+        issues = self.check_config({"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": 0.12, "shares": 10, "discount_rate_basis": "WACC"}})
+        self.assertTrue(any(issue.code == "VALUATION_RATE_BASIS_MISMATCH" for issue in issues))
+
+    def test_pvgo_requires_explicit_equity_rate(self):
+        issues = self.check_config({"wacc": 0.09, "pvgo": {"earnings_ps": 6}})
+        self.assertTrue(any(issue.code == "ASSUMPTION_INVALID_NUMBER" and "pvgo.r" in issue.message for issue in issues))
+
+    def test_net_cash_is_not_added_again(self):
+        cfg = self.scenario_config()
+        cfg["net_debt"], cfg["excess_cash"] = -50, 50
+        self.assertTrue(any(issue.code == "VALUATION_CASH_DOUBLE_COUNT" for issue in self.check_config(cfg)))
+
+    def test_net_income_epv_cannot_deduct_debt_twice(self):
+        cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": 0.12, "shares": 10, "net_debt": 20}}
+        self.assertTrue(any(issue.code == "EPV_EQUITY_DEBT_DOUBLE_COUNT" for issue in self.check_config(cfg)))
+
+    def test_conditional_probability_is_optional_and_excluded(self):
+        for probability in (None, 0.9):
+            cfg = self.scenario_config()
+            case = {"name": "recovery", "role": "conditional", "fcf": [20, 30]}
+            if probability is not None:
+                case["prob"] = probability
+            cfg["scenarios"].append(case)
+            self.assertEqual([], self.check_config(cfg))
+
+    def test_conditional_scenario_still_requires_valid_numbers(self):
+        cfg = self.scenario_config()
+        cfg["scenarios"].append({"name": "recovery", "role": "conditional", "fcf": []})
+        self.assertTrue(any(issue.code == "DCF_SCENARIO_NO_FCF_OR_DRIVERS" for issue in self.check_config(cfg)))
+
+    def test_strong_evidence_does_not_impose_probability_floor(self):
+        cfg = self.scenario_config()
+        cfg["scenarios"][0]["prob"] = 0.9
+        cfg["scenarios"].append({"name": "bull", "prob": 0.1, "fcf": [20, 30], "evidence_strength": "strong", "probability_rationale": "Strong evidence covers only one necessary condition.", "evidence_update": "Raised from 5% after signed customer contract."})
+        self.assertEqual([], self.check_config(cfg))
+
+    def test_probability_diagnostics_require_explanation_not_strength_label(self):
+        cfg = self.scenario_config()
+        case = cfg["scenarios"][0]
+        case.pop("probability_rationale")
+        case["evidence_strength"] = "strong"
+        self.assertEqual({"DCF_PROBABILITY_RATIONALE_MISSING", "DCF_EVIDENCE_UPDATE_MISSING"}, {issue.code for issue in self.check_config(cfg)})
+
+
+class ScopeTests(unittest.TestCase):
+    def test_direct_reply_does_not_require_report_structure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reply.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("这里的资本成本指权益成本。")
+            issues = []
+            CHECKER.check_report(path, None, issues, scope="direct")
+            self.assertEqual([], issues)
+
+    def test_focused_analysis_does_not_require_unused_methods_or_industry_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "focused.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("我的判断：本次利润率变化源于产品组合。来源：[公司披露](https://example.com/results)，2026-10-05。")
+            issues = []
+            CHECKER.check_report(path, None, issues, scope="focused")
+            self.assertEqual([], issues)
+
+    def test_every_scope_enforces_review_for_reports_with_valuation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, assumptions, _ = CHECKER.write_demo_files(tmp)
+            review_fn = mock.Mock(return_value=[{"severity": "P1", "code": "TEST_REVIEW_BLOCKED", "message": "unsupported recovery"}])
+            review = types.SimpleNamespace(review_issues=review_fn)
+            for scope in ("direct", "focused", "deep"):
+                args = argparse.Namespace(report=report, assumptions=assumptions, financials=None, industry=["saas"], language="zh", scope=scope, json=True, strict=False)
+                with self.subTest(scope=scope), mock.patch.dict("sys.modules", {"research_review": review}), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(1, CHECKER.run(args))
+                    self.assertIn("TEST_REVIEW_BLOCKED", output.getvalue())
+                    self.assertTrue(review_fn.call_args.kwargs["require_review"])
+
+
 class IntegratedCheckerTests(unittest.TestCase):
     def test_demo_report_passes_report_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +249,39 @@ class IntegratedCheckerTests(unittest.TestCase):
             issues = []
             CHECKER.check_report(report, None, issues, ["saas"], "zh")
             self.assertEqual([], issues)
+
+    def test_demo_passes_real_review_and_all_checks_in_strict_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, assumptions, financials = CHECKER.write_demo_files(tmp)
+            args = argparse.Namespace(report=report, assumptions=assumptions, financials=financials, industry=["saas"], language="zh", scope="deep", json=True, strict=True)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(0, CHECKER.run(args))
+            self.assertEqual([], json.loads(output.getvalue()))
+
+    def test_real_earnings_bridge_failure_blocks_every_report_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report, assumptions, _ = CHECKER.write_demo_files(tmp)
+            cfg = CHECKER.load_json(assumptions)
+            cfg["research_review"]["earnings_bridge"]["target_margin"] = 0.20
+            with open(assumptions, "w", encoding="utf-8") as handle:
+                json.dump(cfg, handle)
+            for scope in ("direct", "focused", "deep"):
+                args = argparse.Namespace(report=report, assumptions=assumptions, financials=None, industry=["saas"], language="zh", scope=scope, json=True, strict=False)
+                with self.subTest(scope=scope), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(1, CHECKER.run(args))
+                self.assertIn("EPV_EARNINGS_BRIDGE_MISMATCH", output.getvalue())
+
+    def test_legacy_config_is_explicitly_unreviewed_and_cannot_support_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, assumptions, _ = CHECKER.write_demo_files(tmp)
+            cfg = CHECKER.load_json(assumptions)
+            cfg.pop("research_review")
+            with open(assumptions, "w", encoding="utf-8") as handle:
+                json.dump(cfg, handle)
+            for require_review, severity in ((False, "P2"), (True, "P1")):
+                issues = []
+                CHECKER.check_assumptions(assumptions, issues, require_review=require_review)
+                self.assertEqual([("RESEARCH_REVIEW_NOT_PERFORMED", severity)], [(issue.code, issue.severity) for issue in issues])
 
 
 if __name__ == "__main__":
