@@ -113,6 +113,18 @@ def debt_bridge(net_debt, excess_cash, ctx):
         die(f"{ctx}: net_debt 已扣除非经营/过剩现金；请将现金并入 net_debt，excess_cash 必须为 0")
     return nd
 
+EQUITY_FLOOR_NOTE = "普通股有限责任归零仅为简化，不估计破产成本、清算/重整回收或股权期权价值；困境估值需独立模型"
+
+def common_equity(raw_equity, ctx):
+    """Keep the model's residual claim for diagnosis; common shareholders cannot owe the shortfall."""
+    raw_equity = number(raw_equity, f'{ctx}.raw_equity')
+    return {'raw_equity': raw_equity, 'equity': max(0.0, raw_equity),
+            'equity_shortfall': max(0.0, -raw_equity)}
+
+def print_equity_shortfall(result, label):
+    if result['equity_shortfall'] > 0:
+        print(f"  {label}：原始权益 {result['raw_equity']:,.2f} | 权益缺口 {result['equity_shortfall']:,.2f}；{EQUITY_FLOOR_NOTE}")
+
 def model_role(c, ctx):
     role = c.get('role', 'decision')
     if role not in ('decision', 'conditional'):
@@ -169,8 +181,9 @@ def dcf_value(sc, wacc, g, shares, net_debt):
     # Compatibility convention: all equity PV uses end-of-forecast shares. No further terminal dilution.
     sh = number(shares * power(1 + dilution, n, "稀释因子"), "期末股本", positive=True)
     tv_share = terminal_pv / ev if ev else float("nan")
-    equity = number(ev - net_debt, 'DCF equity')
-    return {"ev": ev, "equity": equity, "per_share": number(equity / sh, 'DCF per_share'),
+    bridge = common_equity(ev - net_debt, 'DCF')
+    return {"ev": ev, **bridge, "per_share": number(bridge['equity'] / sh, 'DCF per_share'),
+            "raw_per_share": number(bridge['raw_equity'] / sh, 'DCF raw_per_share'),
             "shares_end": sh, "terminal_fcf": fcfs[-1],
             "exit_pfcf": tv / fcfs[-1] if fcfs[-1] else float("nan"),
             "tv_share": tv_share, "forecast_years": n}
@@ -225,8 +238,8 @@ def epv_value(e, coc, basis='NOPAT', net_debt=0.0, excess_cash=0.0):
         die("EPV: 净利润资本化已经得到权益价值，不得再次减净债")
     ev = number(e / coc, 'EPV value')
     if basis == 'NOPAT':
-        return {'ev': ev, 'equity': ev - net_debt}
-    return {'ev': None, 'equity': ev}
+        return {'ev': ev, **common_equity(ev - net_debt, 'EPV')}
+    return {'ev': None, **common_equity(ev, 'EPV')}
 
 def franchise_growth_value(e, coc, g, roiic, basis='NOPAT', net_debt=0.0, excess_cash=0.0):
     epv_value(e, coc, basis, net_debt, excess_cash)  # Validate the common valuation basis/bridge.
@@ -238,8 +251,8 @@ def franchise_growth_value(e, coc, g, roiic, basis='NOPAT', net_debt=0.0, excess
         return None
     v = number(e * (1 - g / roiic) / (coc - g), 'epv.growth.value')
     if earnings_basis(basis) == 'NOPAT':
-        return {'ev': v, 'equity': v - net_debt}
-    return {'ev': None, 'equity': v}
+        return {'ev': v, **common_equity(v - net_debt, 'epv.growth')}
+    return {'ev': None, **common_equity(v, 'epv.growth')}
 
 def moat_verdict(ratio):
     if ratio < 1.0:  return 'EPV<净资产 → 毁灭价值（ROIC<资本成本），规避'
@@ -263,6 +276,7 @@ def run_epv(c):
     print(f"\n=== 盈利能力价值 EPV === {role_label} | 口径 {basis} | 常态化盈利 {e} | {rate_name} {coc:.2%}")
     epv_ps = ep['equity'] / sh
     print(f"  EPV 权益价值 {ep['equity']:,.1f} | 每股 {epv_ps:,.2f}")
+    print_equity_shortfall(ep, 'EPV')
     if av:
         ratio = ep['equity'] / av
         print(f"  护城河验证：EPV/净资产 = {ratio:.2f}x → {moat_verdict(ratio)}")
@@ -276,7 +290,7 @@ def run_epv(c):
             ee = number(ee, 'epv.asset_series.earnings')
             aa = number(aa, 'epv.asset_series.asset_value', positive=True)
             print(f"    {yr}: {(ee/coc)/aa:.2f}x")
-    growth_ps = None
+    growth_ps, fg = None, None
     g = c.get('growth')
     if g is not None:
         object_input(g, 'epv.growth')
@@ -290,12 +304,13 @@ def run_epv(c):
             growth_ps = fg['equity'] / sh
             warn = ' ⚠ ROIIC<coc，增长毁灭价值' if roiic < coc else ''
             print(f"  成长价值（franchise 严格式，g={gg:.1%}，ROIIC={roiic:.1%}）：每股 {growth_ps:,.2f}{warn}")
+            print_equity_shortfall(fg, '成长价值')
     if av and price:
         asset_ps = av / sh
         ladder_label = '买点阶梯' if role == 'decision' else '条件估值参考'
         print(f"  {ladder_label}：底价 {asset_ps:,.2f}｜EPV {epv_ps:,.2f}" +
-              (f"｜成长调整 {growth_ps:,.2f}" if growth_ps else ""))
-    return {"epv_ps": epv_ps, "growth_ps": growth_ps, "ev": ep['ev'], "equity": ep['equity'], "role": role}
+              (f"｜成长调整 {growth_ps:,.2f}" if growth_ps is not None else ""))
+    return {"epv_ps": epv_ps, "growth_ps": growth_ps, **ep, "growth": fg, "role": role}
 
 # ---------- EVA / 剩余收益 ----------
 
@@ -348,7 +363,8 @@ def run_eva(c, top):
                      "pv_eva": eva_t / discount})
         nopat_t = next_nopat
     value = number(ic + pv_eva, 'EVA value')
-    equity = number(value - nd, 'EVA equity')
+    bridge = common_equity(value - nd, 'EVA')
+    equity = bridge['equity']
     print(f"  剩余收益价值：投入资本 {ic:,.1f} + PV(EVA, {fade}年衰减) {pv_eva:,.1f} = EV {value:,.1f}")
     print("  年度 | 期初资本 | NOPAT | 资本费用 | EVA | 期末资本 | 再投资 | FCFF")
     for row in rows:
@@ -358,9 +374,10 @@ def run_eva(c, top):
     print(f"  终值年 {fade + 1} 起：NOPAT={nopat_t:,.2f}、资本={ic_t:,.2f} 保持不变，ROIC=WACC，EVA=0；期末终值=资本")
     if sh:
         print(f"  权益 {equity:,.1f} | 每股 {equity/sh:,.2f}")
+    print_equity_shortfall(bridge, 'EVA')
     if spread0 < 0:
         print("  ⚠ 当前 EVA 为负：公司未赚回资本成本；新增投资是否毁灭价值取决于其增量回报")
-    return {"per_share": equity / sh if sh else None, "ev": value, "equity": equity,
+    return {"per_share": equity / sh if sh else None, "ev": value, **bridge,
             "pv_eva": pv_eva, "rows": rows, "terminal_ev": ic_t,
             "terminal_nopat": nopat_t, "terminal_growth": 0.0, "terminal_eva": 0.0, "role": role}
 
@@ -414,7 +431,7 @@ def run_montecarlo(c, top):
     nd = debt_bridge(top.get('net_debt', 0.0), c.get('excess_cash', 0), 'montecarlo')
     price = top.get('price')
     if price is not None: price = number(price, 'montecarlo.price', positive=True)
-    vals = []
+    vals, raw_vals, raw_equities, shortfalls = [], [], [], []
     for _ in range(n):
         gr = max(min(rng.gauss(gm, gs), gm + 3 * gs), gm - 3 * gs)   # 截断正态
         mg = rng.triangular(ml, mh, mm)
@@ -424,14 +441,24 @@ def run_montecarlo(c, top):
             rev *= (1 + gr); fcfs.append(rev * mg)
         sc = {'fcf': fcfs, 'fade_years': fade, 'fade_g_start': gr,
               'annual_dilution': dilution}
-        vals.append(dcf_value(sc, wc, g, shares, nd)['per_share'])
+        result = dcf_value(sc, wc, g, shares, nd)
+        vals.append(result['per_share'])
+        raw_vals.append(result['raw_per_share'])
+        raw_equities.append(result['raw_equity'])
+        shortfalls.append(result['equity_shortfall'])
     vals.sort()
     q = lambda p: vals[min(int(p * n), n - 1)]
     mean = sum(vals) / n
     print(f"\n=== 蒙特卡洛（n={n}） === {role_label} | 公允价值分布（每股）")
     print(f"  P10 {q(.10):,.1f} | P25 {q(.25):,.1f} | P50 {q(.50):,.1f} | P75 {q(.75):,.1f} | P90 {q(.90):,.1f} | 均值 {mean:,.1f}")
     out = {"p10": q(.10), "p50": q(.50), "p90": q(.90), "mean": mean,
-           "annual_dilution": dilution, "forecast_years": years + fade, "role": role}
+           "annual_dilution": dilution, "forecast_years": years + fade, "role": role,
+           "raw_mean_per_share": sum(raw_vals) / n, "min_raw_equity": min(raw_equities),
+           "equity_shortfall_count": sum(shortfall > 0 for shortfall in shortfalls),
+           "mean_equity_shortfall": sum(shortfalls) / n}
+    if out['equity_shortfall_count']:
+        print(f"  {out['equity_shortfall_count']}/{n} 次模拟原始权益为负并归零；最低原始权益 {out['min_raw_equity']:,.2f}，"
+              f"全样本平均权益缺口 {out['mean_equity_shortfall']:,.2f}；{EQUITY_FLOOR_NOTE}")
     if price:
         p_loss = sum(1 for v in vals if v < price) / n
         out["p_loss"] = p_loss
@@ -445,8 +472,16 @@ def run_position(results, cfg):
     scs = cfg.get('scenarios') or []
     if not price or not results or not scs:
         return
-    pairs = [(sc.get('prob', 0.0), results[sc['name']]['per_share']) for sc in scs
-             if sc['name'] in results and sc.get('role', 'decision') == 'decision']
+    price = number(price, '仓位.price', positive=True)
+    pairs = []
+    for sc in scs:
+        if sc['name'] not in results or sc.get('role', 'decision') != 'decision':
+            continue
+        p = number(sc.get('prob', 0.0), '仓位.prob')
+        v = number(results[sc['name']]['per_share'], '仓位.per_share')
+        if v < 0:
+            die('仓位: 普通股每股价值不得为负，请先处理有限责任并保留原始权益缺口')
+        pairs.append((p, v))
     if not pairs: return
     if any(not math.isfinite(p) or not 0 <= p <= 1 for p, _ in pairs) or not math.isclose(sum(p for p, _ in pairs), 1, abs_tol=1e-6):
         die('仓位: 决策情景概率必须在 [0,1] 且合计为 1')
@@ -526,6 +561,7 @@ def run(cfg):
             print(f"  {sc['name']:<8} {role_label}  EV {r['ev']:>9,.0f} | 每股 {r['per_share']:>7,.1f} "
                   f"| 退出P/FCF {r['exit_pfcf']:.1f}x | TV占比 {r['tv_share']:.0%}{tv_warn} "
                   f"| 期末股本 {r['shares_end']:.2f}")
+            print_equity_shortfall(r, sc['name'])
         if decision_count:
             print(f"  ── 概率加权公允价值: {weighted:,.1f}/股"
                   + (f"（较现价 {(weighted/price-1):+.0%}）" if price else ""))

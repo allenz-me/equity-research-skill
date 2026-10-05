@@ -83,7 +83,9 @@ description: >-
 python scripts/check_research_output.py --scope focused --report report.md --assumptions valuation.json --financials financials.csv --language zh
 ```
 
-`--scope` 按本次深度显式填写；仅传本次实际产生的文件，完整报告追加 `--industry <slug>`。专题由分析者核查相关行业 KPI，检查器不强制行业全表。`research_review` 放入同一估值 JSON；审查输入及硬门槛见 `references/research-review.md`。P0/P1 必须修正；证据不足则降低结论或将相关预测转为 conditional，不能只写一句解释绕过硬门槛。短答只要包含估值或投资判断，仍执行相关计算和证据检查。
+`--scope` 按本次深度显式填写；仅传本次实际产生的文件。完整报告或提供财务 CSV 时追加 `--industry <slug>`，以便选择行业 KPI 与适用的财报质量检查；专题不强制行业全表。财务 CSV 的期间口径与列名见 `references/forensic-accounting.md`。`research_review` 放入同一估值 JSON；审查输入及硬门槛见 `references/research-review.md`。
+
+P0/P1 数据、计算、结构与证据错误必须修正；证据不足则降低结论或将相关预测转为 conditional，不能只写一句解释绕过硬门槛。`business_risk` 类诊断保留其风险等级，须核查原因、记录证据并落实财报可信度及动作约束；真实经营红旗无需通过修改真实数字来消除，也不因检查器退出成功而视为已核查。短答只要包含估值或投资判断，仍执行相关计算和证据检查。
 
 ### Step 5 · 保存并交付
 
@@ -100,4 +102,4 @@ python scripts/check_research_output.py --scope focused --report report.md --ass
 - 增长持续与盈利恢复是否通过相同证据门槛，conditional 是否排除出决策权重？
 - 提出动作时，可信度约束、反方证据、上/下行证伪与结论是否一致？
 - 完整报告才检查九章、行业全套 KPI、预测登记、来源附录；相关财报更新保留旧基线。
-- 检查器是否按实际 scope 和模块执行，硬错误是否修正，最终格式是否符合用户要求？
+- 检查器是否按实际 scope、行业和模块执行，硬错误是否修正，经营风险是否已核查并反映在结论中，最终格式是否符合用户要求？

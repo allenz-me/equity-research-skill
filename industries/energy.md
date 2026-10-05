@@ -117,9 +117,9 @@
 
 1. **产量模型**：`期初产量 + 新井/新项目投产 − 自然递减 − 计划停产/检修 = 期末产量`。资本开支与维持产量直接联动。
 2. **收入模型**：`volume × realized price`。realized price 从 benchmark ± quality differential ± location differential ± hedge 逐层建桥。
-3. **炼化**：`throughput × utilization × (crack spread × capture rate)`，扣除检修影响。
+3. **炼化**：`炼化毛利代理 = 实际加工量 × 单位 crack spread × capture rate`；实际加工量由日处理产能、利用率与期间天数得到，已知加工量不再乘利用率，检修停机只扣一次。该结果是价差贡献，营业收入另用产品销量乘实现价格。
 4. **中游/LNG**：合同现金流建模，含合同到期时间表、客户信用、吞吐量、费率 escalator 和扩建项目回报。LNG 另拆液化费、Henry Hub/油价 linkage、航运成本和目的地条款。
-5. **油服**：`船队/钻机数 × 利用率 × day rate`，含 backlog 转化和客户 capex 领先指标。
+5. **油服**：`可收费设备天 × 日费率`，设备天由船舶/钻机数、期间天数与可收费利用率得到；含 backlog 转化和客户 capex 领先指标。
 
 最低预测要求：
 

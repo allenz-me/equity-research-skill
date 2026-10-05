@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -23,6 +24,95 @@ def quiet(fn, *args):
     with contextlib.redirect_stdout(output):
         result = fn(*args)
     return result, output.getvalue()
+
+
+class LimitedLiabilityTests(unittest.TestCase):
+    def test_dcf_preserves_residual_claim_but_floors_common_equity(self):
+        # A perpetual FCFF of 10 at 10% has EV 100, independently of its financing.
+        for debt, raw_equity, equity in ((50., 50., 50.), (100., 0., 0.), (150., -50., 0.)):
+            with self.subTest(debt=debt):
+                result = DCF.dcf_value({'fcf': [10.]}, .1, 0., 2., debt)
+                self.assertAlmostEqual(100., result['ev'])
+                self.assertAlmostEqual(raw_equity, result['raw_equity'])
+                self.assertAlmostEqual(max(-raw_equity, 0.), result['equity_shortfall'])
+                self.assertAlmostEqual(raw_equity / 2, result['raw_per_share'])
+                self.assertAlmostEqual(equity, result['equity'])
+                self.assertAlmostEqual(equity / 2, result['per_share'])
+
+    def test_insolvent_scenario_cannot_reverse_expected_return_or_lose_over_100_percent(self):
+        cfg = {'price': 40., 'shares': 1., 'net_debt': 100., 'wacc': .1, 'terminal_g': 0.,
+               'scenarios': [{'name': 'bear', 'prob': .5, 'fcf': [5.]},
+                             {'name': 'bull', 'prob': .5, 'fcf': [20.]}]}
+        results, output = quiet(DCF.run, cfg)
+        self.assertEqual(0., results['bear']['per_share'])
+        self.assertAlmostEqual(-50., results['bear']['raw_equity'])
+        self.assertAlmostEqual(100., results['bull']['per_share'])
+        self.assertIn('概率加权公允价值: 50.0/股（较现价 +25%）', output)
+        self.assertIn('概率加权期望收益 EV = +25%', output)
+        self.assertIn('下行幅度（熊） -100%', output)
+        self.assertIn('Kelly-lite（¼Kelly，上限15%）≈ 4%', output)
+        self.assertIn('原始权益 -50.00 | 权益缺口 50.00', output)
+        self.assertIn('归零仅为简化', output)
+
+    def test_epv_and_franchise_preserve_shortfalls_in_both_earnings_bases(self):
+        cfg = {'normalized_earnings': 10., 'coc': .1, 'shares': 2., 'net_debt': 150.,
+               'asset_value': 50., 'price': 40., 'growth': {'g': .02, 'roiic': .2}}
+        result, output = quiet(DCF.run_epv, cfg)
+        self.assertAlmostEqual(100., result['ev'])
+        self.assertAlmostEqual(-50., result['raw_equity'])
+        self.assertAlmostEqual(50., result['equity_shortfall'])
+        self.assertEqual(0., result['epv_ps'])
+        self.assertEqual(0., result['growth_ps'])
+        self.assertAlmostEqual(112.5, result['growth']['ev'])
+        self.assertAlmostEqual(-37.5, result['growth']['raw_equity'])
+        self.assertIn('成长调整 0.00', output)
+        self.assertIn('成长价值：原始权益 -37.50', output)
+        for fn, args in ((DCF.epv_value, (-10., .1)),
+                         (DCF.franchise_growth_value, (-10., .1, .02, .2))):
+            with self.subTest(fn=fn.__name__):
+                value = fn(*args, basis='NET_INCOME')
+                self.assertIsNone(value['ev'])
+                self.assertLess(value['raw_equity'], 0.)
+                self.assertEqual(0., value['equity'])
+                self.assertEqual(-value['raw_equity'], value['equity_shortfall'])
+
+    def test_eva_preserves_enterprise_value_and_equity_shortfall(self):
+        result, output = quiet(DCF.run_eva,
+                               {'invested_capital': 100., 'nopat': 10., 'fade_years': 2},
+                               {'wacc': .1, 'shares': 2., 'net_debt': 150.})
+        self.assertAlmostEqual(100., result['ev'])
+        self.assertAlmostEqual(-50., result['raw_equity'])
+        self.assertAlmostEqual(50., result['equity_shortfall'])
+        self.assertEqual(0., result['equity'])
+        self.assertEqual(0., result['per_share'])
+        self.assertIn('EVA：原始权益 -50.00', output)
+
+    def test_montecarlo_floors_each_draw_before_computing_distribution(self):
+        cfg = {'n': 2, 'years': 1, 'fade_years': 0, 'base_revenue': 100.,
+               'growth_mean': 0., 'growth_std': 0., 'margin_low': .05,
+               'margin_mode': .1, 'margin_high': .2, 'wacc_low': .1,
+               'wacc_high': .1, 'terminal_g': 0.}
+        with mock.patch.object(DCF.random, 'Random') as rng_factory:
+            rng = rng_factory.return_value
+            rng.gauss.return_value = 0.
+            rng.triangular.side_effect = [.05, .2]
+            rng.uniform.return_value = .1
+            result, output = quiet(DCF.run_montecarlo, cfg,
+                                   {'shares': 1., 'net_debt': 100., 'price': 40.})
+        self.assertAlmostEqual(50., result['mean'])
+        self.assertAlmostEqual(25., result['raw_mean_per_share'])
+        self.assertEqual(0., result['p10'])
+        self.assertAlmostEqual(100., result['p90'])
+        self.assertEqual(.5, result['p_loss'])
+        self.assertEqual(1, result['equity_shortfall_count'])
+        self.assertAlmostEqual(-50., result['min_raw_equity'])
+        self.assertAlmostEqual(25., result['mean_equity_shortfall'])
+        self.assertIn('1/2 次模拟原始权益为负并归零', output)
+
+    def test_position_rejects_external_negative_common_share_values(self):
+        cfg = {'price': 40., 'scenarios': [{'name': 'bear', 'prob': 1.}]}
+        with self.assertRaisesRegex(ValueError, '普通股每股价值不得为负'):
+            quiet(DCF.run_position, {'bear': {'per_share': -50.}}, cfg)
 
 
 class DilutionTests(unittest.TestCase):

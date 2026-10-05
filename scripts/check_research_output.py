@@ -46,15 +46,17 @@ class Issue:
     message: str
     detail: str = ""
     file: str = ""
+    category: str = "validation"
 
     def line(self) -> str:
         loc = f" [{self.file}]" if self.file else ""
         detail = f"\n    {self.detail}" if self.detail else ""
-        return f"[{self.severity}] {self.code}{loc}: {self.message}{detail}"
+        category = " [经营风险，须人工核查]" if self.category == "business_risk" else ""
+        return f"[{self.severity}]{category} {self.code}{loc}: {self.message}{detail}"
 
 
-def add(issues: List[Issue], severity: str, code: str, message: str, detail: str = "", file: str = "") -> None:
-    issues.append(Issue(severity, code, message, detail, file))
+def add(issues: List[Issue], severity: str, code: str, message: str, detail: str = "", file: str = "", category: str = "validation") -> None:
+    issues.append(Issue(severity, code, message, detail, file, category))
 
 
 def load_text(path: str) -> str:
@@ -88,7 +90,7 @@ def parse_number(value) -> Optional[float]:
         s = s[:-1]
     s = s.replace(",", "").replace("$", "").replace("￥", "").replace("¥", "")
     s = s.replace("倍", "").replace("x", "").replace("X", "")
-    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    m = re.search(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", s)
     if not m:
         return None
     return float(m.group(0)) * mult
@@ -629,6 +631,50 @@ def check_ratio(
         )
 
 
+def financial_period(value):
+    """Return (frequency, fiscal year, slot) only for explicit period labels."""
+    label = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    label = re.sub(r"[\s_/-]+", "", label)
+    annual = re.fullmatch(r"(?:FY)?(\d{4})(?:FY|年度|年)?", label)
+    if annual:
+        return "annual", int(annual[1]), 1
+    quarter = re.fullmatch(r"(?:FY)?(\d{4})年?Q([1-4])", label)
+    reverse_quarter = re.fullmatch(r"Q([1-4])(?:FY)?(\d{4})", label)
+    if quarter or reverse_quarter:
+        year, slot = (quarter[1], quarter[2]) if quarter else (reverse_quarter[2], reverse_quarter[1])
+        return "quarter", int(year), int(slot)
+    half = re.fullmatch(r"(?:FY)?(\d{4})年?H([12])", label)
+    reverse_half = re.fullmatch(r"H([12])(?:FY)?(\d{4})", label)
+    if half or reverse_half:
+        year, slot = (half[1], half[2]) if half else (reverse_half[2], reverse_half[1])
+        return "halfyear", int(year), int(slot)
+    chinese_quarter = re.fullmatch(r"(\d{4})年第?([一二三四1234])季度", label)
+    if chinese_quarter:
+        slot = chinese_quarter[2]
+        return "quarter", int(chinese_quarter[1]), int(slot) if slot.isdigit() else "一二三四".index(slot) + 1
+    chinese_half = re.fullmatch(r"(\d{4})年([上下])半年", label)
+    if chinese_half:
+        return "halfyear", int(chinese_half[1]), 1 if chinese_half[2] == "上" else 2
+    return None
+
+
+def financial_period_index(rows, period_col, path, issues):
+    index, ambiguous = {}, set()
+    for row in rows:
+        key = financial_period(row.get(period_col)) if period_col else None
+        if key is None:
+            continue
+        if key in index or key in ambiguous:
+            index.pop(key, None)
+            ambiguous.add(key)
+        else:
+            index[key] = row
+    for key in sorted(ambiguous):
+        add(issues, "P1", "FINANCIALS_DUPLICATE_PERIOD", "同一频率和期间有重复行，不能选一行作为比较基数。",
+            str(key), path)
+    return index
+
+
 def check_growth(
     issues: List[Issue],
     path: str,
@@ -636,18 +682,37 @@ def check_growth(
     period_col: Optional[str],
     value_col: Optional[str],
     provided_col: Optional[str],
-    lag: int,
+    comparison: str,
     code: str,
     name: str,
+    period_index=None,
 ) -> None:
-    if not value_col or not provided_col or len(rows) <= lag:
+    if not value_col or not provided_col:
         return
-    for idx in range(lag, len(rows)):
-        cur = row_num(rows[idx], value_col)
-        prev = row_num(rows[idx - lag], value_col)
-        provided = row_num(rows[idx], provided_col)
-        label = rows[idx].get(period_col, f"row {idx + 2}") if period_col else f"row {idx + 2}"
-        if cur is None or prev in (None, 0) or provided is None:
+    index = period_index if period_index is not None else financial_period_index(rows, period_col, path, issues)
+    for idx, row in enumerate(rows):
+        provided = row_num(row, provided_col)
+        if provided is None:
+            continue
+        label = row.get(period_col, f"row {idx + 2}") if period_col else f"row {idx + 2}"
+        key = financial_period(label)
+        if key is None or index.get(key) is not row:
+            add(issues, "P2", "FINANCIALS_GROWTH_UNCHECKED", f"{label} 的{name}未复核：期间未知或重复，不能按行距猜测。", file=path)
+            continue
+        frequency, year, slot = key
+        if comparison == "yoy":
+            prior_key = frequency, year - 1, slot
+        elif frequency == "quarter":
+            prior_key = frequency, year if slot > 1 else year - 1, slot - 1 if slot > 1 else 4
+        else:
+            add(issues, "P2", "FINANCIALS_GROWTH_UNCHECKED", f"{label} 的{name}未复核：营收环比列仅适用于独立季度。", file=path)
+            continue
+        prior = index.get(prior_key)
+        cur = row_num(row, value_col)
+        prev = row_num(prior, value_col) if prior is not None else None
+        if cur is None or prev in (None, 0):
+            add(issues, "P2", "FINANCIALS_GROWTH_UNCHECKED", f"{label} 的{name}未复核：缺少准确的可比期或可用数值。",
+                f"required_period={prior_key}", path)
             continue
         expected = cur / prev - 1
         if abs(expected - provided) > 0.015:
@@ -669,9 +734,8 @@ def growth_rate(cur, prev):
     return cur / prev - 1
 
 
-def check_forensics(rows, aliases, path, issues) -> None:
-    """财报质量核查检查：应计质量 / 现金转化 / DSO与递延背离 / Beneish M-Score。
-    列名要求见 references/forensic-accounting.md 第 7 节；缺列自动跳过对应项。"""
+def check_forensics(rows, aliases, path, issues, period_index=None, industries=None) -> None:
+    """Use comparable actual annual records, never adjacent quarters or forecasts."""
     ni = pick(aliases, ["net_income", "netincome", "净利润"])
     cfo = pick(aliases, ["cfo", "operating_cash_flow", "cash_from_operations", "经营现金流"])
     ta = pick(aliases, ["total_assets", "totalassets", "总资产"])
@@ -685,46 +749,108 @@ def check_forensics(rows, aliases, path, issues) -> None:
     sga = pick(aliases, ["sga", "sg_a", "销售管理费用"])
     tl = pick(aliases, ["total_liabilities", "totalliabilities", "总负债"])
 
-    # -- 应计比率与现金转化（逐行 + 趋势） --
-    conv_series = []
+    if not any((ni and cfo and ta, rec and rev, dfr and rev)):
+        return
+    sectors = set(normalize_industry_args(industries)) - {"auto"}
+    financial_sectors = {"banks", "insurance"}
+    if sectors and sectors <= financial_sectors:
+        add(issues, "P3", "FORENSIC_SECTOR_EXEMPT", "金融/保险不运行通用应计、现金转化及 M-Score 等筛查；须按行业替代项人工核查。", file=path)
+        return
+    if sectors & financial_sectors:
+        add(issues, "P2", "FORENSIC_MIXED_INDUSTRIES", "混合金融与非金融业务不整表豁免；通用筛查仅供提示，须拆分适用业务后复核。", file=path)
+
+    period_col = pick(aliases, ["period", "fiscal_period", "date", "财期", "期间"])
+    index = period_index if period_index is not None else financial_period_index(rows, period_col, path, issues)
+    actual_col = pick(aliases, ["actual", "is_actual", "data_type", "实际", "数据类型"])
+    actual_index = {}
+    unknown_periods, invalid_actual, forecast_count, nonannual_count = [], [], 0, 0
     for idx, row in enumerate(rows):
-        label = row.get(pick(aliases, ["period", "fiscal_period", "date", "财期", "期间"]) or "", f"row {idx + 2}")
+        label = row.get(period_col, f"row {idx + 2}") if period_col else f"row {idx + 2}"
+        if actual_col:
+            status = str(row.get(actual_col, "")).strip().lower()
+            if status in {"false", "0", "forecast", "estimate", "预测"}:
+                forecast_count += 1
+                continue
+            if status not in {"true", "1", "actual", "实际"}:
+                invalid_actual.append(label)
+                continue
+        key = financial_period(label)
+        if key is None or index.get(key) is not row:
+            unknown_periods.append(label)
+        elif key[0] == "annual":
+            actual_index[key] = row
+        else:
+            nonannual_count += 1
+    if unknown_periods or invalid_actual:
+        add(issues, "P2", "FORENSIC_PERIOD_UNCHECKED", "部分财务行的期间或实际/预测标记不明确，未纳入财报质量筛查。",
+            f"unknown_periods={unknown_periods}; invalid_actual={invalid_actual}", path)
+    if forecast_count:
+        add(issues, "P3", "FORENSIC_FORECAST_EXCLUDED", "预测行未作为已实现财报参与质量筛查。", f"rows={forecast_count}", path)
+    if nonannual_count:
+        add(issues, "P3" if actual_index else "P2", "FORENSIC_ANNUAL_DATA_REQUIRED",
+            "财报质量筛查仅使用可比实际年度；季度/半年行不年化，也不与年度行混算。", file=path)
+    annual_keys = sorted(actual_index)
+    if not annual_keys:
+        return
+    annual_rows = [actual_index[key] for key in annual_keys]
+
+    def risk(severity, code, message, detail=""):
+        add(issues, severity, code, message, detail, path, category="business_risk")
+
+    # -- 应计比率与现金转化（实际年度，资产使用平均数） --
+    avg_assets = pick(aliases, ["average_total_assets", "avg_total_assets", "平均总资产"])
+    conv_series = []
+    for key, row in zip(annual_keys, annual_rows):
+        label = row.get(period_col, str(key)) if period_col else str(key)
         ni_v, cfo_v, ta_v = row_num(row, ni), row_num(row, cfo), row_num(row, ta)
-        if ni_v is not None and cfo_v is not None and ta_v not in (None, 0):
-            accr = (ni_v - cfo_v) / ta_v
+        assets = row_num(row, avg_assets)
+        prior = actual_index.get(("annual", key[1] - 1, 1))
+        prior_assets = row_num(prior, ta) if prior is not None else None
+        if assets is None and ta_v is not None and prior_assets is not None:
+            assets = (ta_v + prior_assets) / 2
+        if ni_v is not None and cfo_v is not None and assets is not None and assets > 0:
+            accr = (ni_v - cfo_v) / assets
             if accr > 0.10:
-                add(issues, "P1", "FORENSIC_HIGH_ACCRUALS", f"{label} 总应计比率 {accr:.1%} > 10%，盈利质量红旗。",
-                    f"net_income={ni_v}, cfo={cfo_v}, total_assets={ta_v}", path)
+                risk("P1", "FORENSIC_HIGH_ACCRUALS", f"{label} 总应计比率 {accr:.1%} > 10%，盈利质量红旗；须人工核查并落实可信度评级和动作约束。",
+                     f"net_income={ni_v}, cfo={cfo_v}, average_total_assets={assets}")
             elif accr > 0.05:
-                add(issues, "P2", "FORENSIC_ELEVATED_ACCRUALS", f"{label} 总应计比率 {accr:.1%} 偏高（5–10%）。", "", path)
+                risk("P2", "FORENSIC_ELEVATED_ACCRUALS", f"{label} 总应计比率 {accr:.1%} 偏高（5–10%）；须核查原因。")
         if ni_v not in (None, 0) and cfo_v is not None and ni_v > 0:
-            conv_series.append((label, cfo_v / ni_v))
+            conv_series.append((key[1], label, cfo_v / ni_v))
+    if ni and cfo and ta and not any(row_num(row, avg_assets) is not None or ("annual", key[1] - 1, 1) in actual_index
+                                   for key, row in zip(annual_keys, annual_rows)):
+        add(issues, "P2", "FORENSIC_ACCRUALS_UNCHECKED", "应计筛查缺少平均总资产或相邻年度期末资产，未用单一期末资产代替。", file=path)
     if len(conv_series) >= 3:
-        last = conv_series[-1][1]
-        declining = all(conv_series[i][1] >= conv_series[i + 1][1] for i in range(len(conv_series) - 3, len(conv_series) - 1))
+        last = conv_series[-1][2]
+        recent = conv_series[-3:]
+        declining = all(a[0] + 1 == b[0] and a[2] >= b[2] for a, b in zip(recent, recent[1:]))
         if last < 0.8 and declining:
-            add(issues, "P2", "FORENSIC_CASH_CONVERSION_DECLINING",
-                f"现金转化率降至 {last:.0%}（<80% 且连续下滑），利润与现金背离。",
-                ", ".join(f"{l}={v:.0%}" for l, v in conv_series[-3:]), path)
+            risk("P2", "FORENSIC_CASH_CONVERSION_DECLINING",
+                 f"现金转化率降至 {last:.0%}（<80% 且连续年度下滑），利润与现金背离。",
+                 ", ".join(f"{label}={value:.0%}" for _, label, value in recent))
 
-    # -- DSO / 递延收入 与收入增速背离（末两行） --
-    if len(rows) >= 2 and rev:
-        r_g = growth_rate(row_num(rows[-1], rev), row_num(rows[-2], rev))
+    latest = annual_keys[-1]
+    t = actual_index[latest]
+    p = actual_index.get(("annual", latest[1] - 1, 1))
+    # -- DSO / 递延收入 与收入增速背离（最新年度与上一年度） --
+    if p is not None and rev:
+        r_g = growth_rate(row_num(t, rev), row_num(p, rev))
         if rec:
-            rec_g = growth_rate(row_num(rows[-1], rec), row_num(rows[-2], rec))
+            rec_g = growth_rate(row_num(t, rec), row_num(p, rec))
             if r_g is not None and rec_g is not None and rec_g - r_g > 0.15:
-                add(issues, "P2", "FORENSIC_DSO_DIVERGENCE",
-                    f"应收增速 {rec_g:.0%} 超收入增速 {r_g:.0%} 逾 15pp，警惕塞货/放宽信用/提前确认。", "", path)
+                risk("P2", "FORENSIC_DSO_DIVERGENCE",
+                     f"应收增速 {rec_g:.0%} 超收入增速 {r_g:.0%} 逾 15pp，警惕塞货/放宽信用/提前确认。")
         if dfr:
-            d_g = growth_rate(row_num(rows[-1], dfr), row_num(rows[-2], dfr))
+            d_g = growth_rate(row_num(t, dfr), row_num(p, dfr))
             if r_g is not None and d_g is not None and r_g > 0 and d_g < 0:
-                add(issues, "P2", "FORENSIC_DEFERRED_DIVERGENCE",
-                    f"收入增长 {r_g:.0%} 而递延收入下降 {d_g:.0%}，订阅型公司此为透支未来信号。", "", path)
+                risk("P2", "FORENSIC_DEFERRED_DIVERGENCE",
+                     f"收入增长 {r_g:.0%} 而递延收入下降 {d_g:.0%}，订阅型公司需核查是否透支未来。")
 
-    # -- Beneish M-Score（末两行，需全列） --
+    # -- Beneish M-Score（可比实际年度，需全列） --
     needed = [rev, rec, gp, ppe, ca, dep, sga, tl, ta, ni, cfo]
-    if len(rows) >= 2 and all(needed):
-        t, p = rows[-1], rows[-2]
+    if p is None and (all(needed) or (rev and (rec or dfr))):
+        add(issues, "P2", "FORENSIC_COMPARABLE_YEAR_MISSING", "最新实际年度缺少上一年度，未跨缺期计算 M-Score 或应收/递延趋势。", file=path)
+    if p is not None and all(needed):
         try:
             def v(row, col):
                 x = row_num(row, col)
@@ -746,15 +872,15 @@ def check_forensics(rows, aliases, path, issues) -> None:
             detail = (f"M={m:.2f} | DSRI={dsri:.2f} GMI={gmi:.2f} AQI={aqi:.2f} SGI={sgi:.2f} "
                       f"DEPI={depi:.2f} SGAI={sgai:.2f} TATA={tata:.3f} LVGI={lvgi:.2f}")
             if m > -1.78:
-                add(issues, "P1", "FORENSIC_MSCORE_FLAG",
-                    f"Beneish M-Score = {m:.2f} > -1.78，落入盈余操纵可疑区，逐项手工核查。", detail, path)
+                risk("P1", "FORENSIC_MSCORE_FLAG",
+                     f"Beneish M-Score = {m:.2f} > -1.78，落入盈余操纵可疑区；须逐项核查并落实 C/D 评级动作约束。", detail)
             else:
                 add(issues, "P3", "FORENSIC_MSCORE_INFO", f"Beneish M-Score = {m:.2f}（阈值 -1.78，未越限）。", detail, path)
         except (ValueError, ZeroDivisionError):
             add(issues, "P3", "FORENSIC_MSCORE_SKIPPED", "M-Score 所需列存在但含缺失/零值，跳过计算。", "", path)
 
 
-def check_financials(path: str, issues: List[Issue]) -> None:
+def check_financials(path: str, issues: List[Issue], industries: Optional[Sequence[str]] = None) -> None:
     rows, aliases = load_csv(path, issues)
     if not rows:
         add(issues, "P1", "FINANCIALS_EMPTY", "财务 CSV 没有数据行。", file=path)
@@ -820,10 +946,11 @@ def check_financials(path: str, issues: List[Issue]) -> None:
                 if not close_enough(expected, ce):
                     add(issues, "P1", "CASH_FLOW_ROLL_FORWARD_MISMATCH", f"{label} 的现金流量表勾稽不一致。", f"expected_ending_cash={expected}, provided={ce}", path)
 
-    check_growth(issues, path, rows, period, revenue, yoy_revenue, 4, "REVENUE_YOY_MISMATCH", "营收同比")
-    check_growth(issues, path, rows, period, revenue, qoq_revenue, 1, "REVENUE_QOQ_MISMATCH", "营收环比")
+    period_index = financial_period_index(rows, period, path, issues)
+    check_growth(issues, path, rows, period, revenue, yoy_revenue, "yoy", "REVENUE_YOY_MISMATCH", "营收同比", period_index)
+    check_growth(issues, path, rows, period, revenue, qoq_revenue, "qoq", "REVENUE_QOQ_MISMATCH", "营收环比", period_index)
 
-    check_forensics(rows, aliases, path, issues)
+    check_forensics(rows, aliases, path, issues, period_index, industries)
 
 
 def sort_issues(issues: Iterable[Issue]) -> List[Issue]:
@@ -845,6 +972,8 @@ def print_report(issues: List[Issue], as_json: bool = False) -> None:
     print(f"财务/估值一致性检查发现 {len(ordered)} 项：{summary}\n")
     for issue in ordered:
         print(issue.line())
+    if any(issue.category == "business_risk" for issue in ordered):
+        print("\n经营风险不作为算术/结构检查失败条件；仍须逐项人工核查并落实可信度 C/D 的动作约束。退出码为 0 不表示风险已核查或投资结论获验证。")
 
 
 def run(args) -> int:
@@ -855,12 +984,17 @@ def run(args) -> int:
     if args.report:
         check_report(args.report, assumptions, issues, args.industry, args.language, getattr(args, "scope", "deep"))
     if args.financials:
-        check_financials(args.financials, issues)
+        industries = normalize_industry_args(args.industry)
+        if args.report:
+            # Merge declarations even with explicit CLI slugs: a secondary banking
+            # business must not exempt an otherwise nonfinancial group.
+            industries += detect_declared_industries(load_text(args.report), load_industry_rules())
+        check_financials(args.financials, issues, industries)
     if not any([args.report, args.assumptions, args.financials]):
         add(issues, "P1", "NO_INPUT", "请至少提供 --report、--assumptions 或 --financials 之一。")
     print_report(issues, args.json)
     fail_levels = {"P0", "P1"} if not args.strict else {"P0", "P1", "P2"}
-    return 1 if any(issue.severity in fail_levels for issue in issues) else 0
+    return 1 if any(issue.severity in fail_levels and issue.category != "business_risk" for issue in issues) else 0
 
 
 def write_demo_files(tmp: str) -> Tuple[str, str, str]:

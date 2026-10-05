@@ -86,7 +86,7 @@ SaaS 内在价值可以拆成：
 | ACV / ARPA | 年合同价值 / 每账户收入 | 客户质量与上行空间 | 企业客户 mix 变化会推高但降低客户数增速 |
 | Net new ARR | 新增 ARR | 增长动能 | 季节性强，需看 4Q rolling |
 | CAC payback | 获客成本回收月数 | S&M 效率 | 用 gross margin-adjusted ARR 更保守 |
-| Magic number | 净新增 ARR × 4 × gross margin / 上季 S&M | 销售效率 | 对季节性、企业大单和价格调整敏感 |
+| Magic number | (本季订阅收入 − 上季订阅收入) × 4 / 上季 S&M | 销售效率 | 季度收入差才乘 4 年化；若采用本季净新增 ARR / 上季 S&M 的 ARR 效率口径，不再乘 4；毛利调整另标，不能混比 |
 | Rule of 40 | 收入增长率 + FCF margin 或 operating margin | 增长和利润平衡 | 口径必须统一，不要混用 non-GAAP operating margin 和 unlevered FCF |
 | Gross margin | gross profit / revenue | 软件经济性 | Professional services、hosting、AI inference cost 会压低 |
 | S&M / Revenue | 销售营销费用率 | 增长投入强度 | 高增长阶段高费用率不一定坏，需结合新增 ARR |

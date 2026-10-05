@@ -87,6 +87,14 @@ class FinancialHeaderTests(unittest.TestCase):
         issues, _ = self.check_csv("期间,收入,毛利,毛利率", "2025,100,60,40%")
         self.assertEqual(["GROSS_MARGIN_MISMATCH"], [issue.code for issue in issues])
 
+    def test_scientific_notation_preserves_tiny_cash_flow_residuals(self):
+        issues, _ = self.check_csv("period,revenue,cfo,capex,fcf,fcf_margin",
+                                   "2024Q4,440,10.8,10.8,1.7763568394002505e-15,4.037174635000569e-18")
+        self.assertEqual([], issues)
+        for value, expected in (("-1.5e-3", -.0015), ("$1.2E+3", 1200), ("1e1%", .1), (".5", .5)):
+            with self.subTest(value=value):
+                self.assertAlmostEqual(expected, CHECKER.parse_number(value))
+
     def test_duplicate_and_normalized_collisions_are_rejected(self):
         for duplicate in ("revenue,revenue", "Revenue,ＲＥＶＥＮＵＥ", "收入,收 入"):
             with self.subTest(duplicate=duplicate):
@@ -99,6 +107,139 @@ class FinancialHeaderTests(unittest.TestCase):
         issues, aliases = self.check_csv("期间,收入,---", "2025,100,60")
         self.assertEqual(["FINANCIALS_EMPTY_HEADER"], [issue.code for issue in issues])
         self.assertNotIn("", aliases)
+
+
+class FinancialPeriodTests(unittest.TestCase):
+    def check_csv(self, data, industries=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "financials.csv")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            issues = []
+            CHECKER.check_financials(path, issues, industries)
+            return issues
+
+    def test_annual_yoy_uses_previous_year_and_checks_short_histories(self):
+        data = "period,revenue,revenue_yoy\n2021,100,\n2022,110,10%\n2023,121,10%\n2024,133.1,10%\n2025,146.41,10%\n"
+        self.assertEqual([], self.check_csv(data))
+        wrong = "period,revenue,revenue_yoy\n2023,100,\n2024,110,100%\n2025,121,100%\n"
+        self.assertEqual(["REVENUE_YOY_MISMATCH"] * 2, [issue.code for issue in self.check_csv(wrong)])
+
+    def test_unsorted_mixed_frequencies_match_only_their_own_periods(self):
+        data = "period,revenue,revenue_yoy\n2025Q2,300,50%\nFY2025,110,10%\n2024Q2,200,\n2024,100,\n2025H2,240,20%\n2024H2,200,\n"
+        self.assertEqual([], self.check_csv(data))
+
+    def test_quarter_qoq_handles_year_boundary_and_missing_periods(self):
+        valid = "period,revenue,revenue_qoq\n2025Q1,110,10%\n2024Q4,100,\n"
+        self.assertEqual([], self.check_csv(valid))
+        missing = valid.replace("2024Q4", "2024Q3")
+        issues = self.check_csv(missing)
+        self.assertEqual(["FINANCIALS_GROWTH_UNCHECKED"], [issue.code for issue in issues])
+
+    def test_unknown_periods_and_annual_qoq_are_not_guessed(self):
+        for label in ("Q1", "2025-03-31", "TTM", "2025"):
+            with self.subTest(label=label):
+                issues = self.check_csv(f"period,revenue,revenue_qoq\n{label},100,10%\n")
+                self.assertEqual(["FINANCIALS_GROWTH_UNCHECKED"], [issue.code for issue in issues])
+
+    def test_duplicate_period_aliases_are_rejected(self):
+        issues = self.check_csv("period,revenue,revenue_yoy\n2024,100,\n2025,110,10%\nFY2025,120,20%\n")
+        self.assertTrue(any(issue.code == "FINANCIALS_DUPLICATE_PERIOD" and issue.severity == "P1" for issue in issues))
+
+    @staticmethod
+    def forensic_csv(periods, forecast=False):
+        data = "period,revenue,receivables,gross_profit,ppe,current_assets,depreciation,sga,total_liabilities,total_assets,net_income,cfo,data_type\n"
+        for period, revenue in periods:
+            status = "forecast" if forecast and period == "2026" else "actual"
+            data += ",".join(map(str, [period, revenue, .2 * revenue, .5 * revenue, 100, 200, 10, .1 * revenue,
+                                      200, 500, .1 * revenue, .1 * revenue, status])) + "\n"
+        return data
+
+    def test_seasonal_quarters_never_generate_annual_mscore(self):
+        data = self.forensic_csv([("2024Q1", 100), ("2024Q2", 200), ("2024Q3", 100),
+                                  ("2024Q4", 100), ("2025Q1", 100), ("2025Q2", 200)])
+        issues = self.check_csv(data)
+        self.assertEqual(["FORENSIC_ANNUAL_DATA_REQUIRED"], [issue.code for issue in issues])
+
+    def test_forensics_sorts_annuals_and_excludes_forecasts_and_quarters(self):
+        data = self.forensic_csv([("2025", 100), ("2024", 100), ("2025Q2", 200), ("2026", 1000)], forecast=True)
+        issues = self.check_csv(data)
+        score = next(issue for issue in issues if issue.code == "FORENSIC_MSCORE_INFO")
+        self.assertIn("M=-2.48", score.detail)
+        self.assertFalse(any(issue.category == "business_risk" for issue in issues))
+        self.assertIn("FORENSIC_FORECAST_EXCLUDED", [issue.code for issue in issues])
+
+    def test_forensics_does_not_bridge_missing_years_or_unknown_periods(self):
+        for periods, expected in (([("2023", 100), ("2025", 200)], "FORENSIC_COMPARABLE_YEAR_MISSING"),
+                                  ([("Q1", 100), ("Q2", 200)], "FORENSIC_PERIOD_UNCHECKED")):
+            with self.subTest(periods=periods):
+                issues = self.check_csv(self.forensic_csv(periods))
+                self.assertIn(expected, [issue.code for issue in issues])
+                self.assertFalse(any(issue.code.startswith("FORENSIC_MSCORE") for issue in issues))
+
+    def test_accruals_use_average_assets(self):
+        data = "period,revenue,net_income,cfo,total_assets\n2024,100,10,10,100\n2025,100,40,10,300\n"
+        issue = next(issue for issue in self.check_csv(data) if issue.code == "FORENSIC_HIGH_ACCRUALS")
+        self.assertIn("15.0%", issue.message)
+        self.assertIn("average_total_assets=200.0", issue.detail)
+
+
+class BusinessRiskTests(unittest.TestCase):
+    DATA = "period,revenue,net_income,cfo,total_assets,average_total_assets\n2025,500,100,10,500,500\n"
+
+    def run_check(self, data=None, strict=False, industries=None, report=None, as_json=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "financials.csv")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(data or self.DATA)
+            report_path = None
+            if report is not None:
+                report_path = os.path.join(tmp, "report.md")
+                with open(report_path, "w", encoding="utf-8") as handle:
+                    handle.write(report)
+            args = argparse.Namespace(report=report_path, assumptions=None, financials=path, industry=industries,
+                                      language="zh", scope="direct", json=as_json, strict=strict)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                result = CHECKER.run(args)
+            return result, json.loads(output.getvalue()) if as_json else output.getvalue()
+
+    def test_risks_remain_visible_without_becoming_validation_failures(self):
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                code, issues = self.run_check(strict=strict)
+                self.assertEqual(0, code)
+                self.assertEqual([("P1", "business_risk")], [(issue["severity"], issue["category"]) for issue in issues])
+                self.assertIn("人工核查", issues[0]["message"])
+
+    def test_text_output_does_not_certify_risk_resolution(self):
+        code, output = self.run_check(as_json=False)
+        self.assertEqual(0, code)
+        self.assertIn("退出码为 0 不表示风险已核查", output)
+        self.assertNotIn("检查通过", output)
+
+    def test_real_validation_errors_still_block_with_business_risks(self):
+        data = "period,revenue,net_income,cfo,total_assets,average_total_assets,gross_profit,gross_margin\n2025,500,100,10,500,500,100,50%\n"
+        for strict in (False, True):
+            code, issues = self.run_check(data, strict=strict)
+            self.assertEqual(1, code)
+            self.assertIn("GROSS_MARGIN_MISMATCH", [issue["code"] for issue in issues])
+
+    def test_financial_industries_are_exempt_but_mixed_groups_are_not(self):
+        for industries in (["banks"], ["insurance"], ["banks", "insurance"]):
+            with self.subTest(industries=industries):
+                code, issues = self.run_check(industries=industries, strict=True)
+                self.assertEqual(0, code)
+                self.assertEqual(["FORENSIC_SECTOR_EXEMPT"], [issue["code"] for issue in issues])
+        _, mixed = self.run_check(industries=["banks", "saas"])
+        self.assertIn("FORENSIC_MIXED_INDUSTRIES", [issue["code"] for issue in mixed])
+        self.assertIn("FORENSIC_HIGH_ACCRUALS", [issue["code"] for issue in mixed])
+
+    def test_report_industry_auto_and_secondary_business_are_respected(self):
+        code, issues = self.run_check(industries=["auto"], report="行业附录: banks", strict=True)
+        self.assertEqual(0, code)
+        self.assertEqual(["FORENSIC_SECTOR_EXEMPT"], [issue["code"] for issue in issues])
+        _, mixed = self.run_check(industries=["banks"], report="行业附录: saas")
+        self.assertIn("FORENSIC_HIGH_ACCRUALS", [issue["code"] for issue in mixed])
 
 
 class ValuationAssumptionTests(unittest.TestCase):
