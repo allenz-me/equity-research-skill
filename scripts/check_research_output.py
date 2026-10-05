@@ -74,26 +74,53 @@ def norm_key(value: str) -> str:
     return "".join(char for char in normalized if char.isalnum())
 
 
+def is_finite_number(value) -> bool:
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def parse_number(value) -> Optional[float]:
+    """Parse a complete financial number; missing markers alone return None."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        if isinstance(value, float) and math.isnan(value):
-            return None
-        return float(value)
-    s = str(value).strip()
-    if not s or s in {"-", "—", "N/A", "NA", "n/a", "未获取到", "not obtained", "not available"}:
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError("数值超出有限范围") from exc
+        if isinstance(value, bool) or not math.isfinite(number):
+            raise ValueError("必须是有限数值，不能是布尔值")
+        return number
+    if not isinstance(value, str):
+        raise ValueError("不支持的数值类型")
+    s = unicodedata.normalize("NFKC", value).strip()
+    if not s or s.casefold() in {"-", "—", "n/a", "na", "未获取到", "not obtained", "not available"}:
         return None
-    mult = 1.0
-    if s.endswith("%"):
-        mult = 0.01
-        s = s[:-1]
-    s = s.replace(",", "").replace("$", "").replace("￥", "").replace("¥", "")
-    s = s.replace("倍", "").replace("x", "").replace("X", "")
-    m = re.search(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", s)
+    negative = s.startswith("(") and s.endswith(")")
+    if negative:
+        s = s[1:-1].strip()
+    m = re.fullmatch(
+        r"(?P<sign>[+-]?)(?P<currency>[$¥]?)(?P<after>[+-]?)\s*"
+        r"(?P<number>(?:(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)"
+        r"\s*(?P<unit>%|倍|[xXkKmMbB]|(?:万亿|亿|万|千)(?:元|股)?|元|股)?", s,
+    )
     if not m:
-        return None
-    return float(m.group(0)) * mult
+        raise ValueError("不支持或不完整的数值格式")
+    sign = m["sign"] or m["after"]
+    if (m["sign"] and m["after"]) or (negative and sign):
+        raise ValueError("括号或正负号重复")
+    unit = m["unit"] or ""
+    if m["currency"] and (unit in {"%", "倍", "x", "X"} or unit.endswith("股")):
+        raise ValueError("货币符号与数值单位冲突")
+    scale = unit.rstrip("元股").lower()
+    mult = {"": 1, "%": .01, "倍": 1, "x": 1, "千": 1e3, "万": 1e4,
+            "亿": 1e8, "万亿": 1e12, "k": 1e3, "m": 1e6, "b": 1e9}[scale]
+    number = float(m["number"].replace(",", "")) * mult
+    if not math.isfinite(number):
+        raise ValueError("数值或单位换算结果超出有限范围")
+    return -number if negative or sign == "-" else number
 
 
 def pct(value: float) -> str:
@@ -101,6 +128,8 @@ def pct(value: float) -> str:
 
 
 def close_enough(a: float, b: float, rel_tol: float = 0.015, abs_tol: float = 0.02) -> bool:
+    if not math.isfinite(a) or not math.isfinite(b):
+        return False
     return abs(a - b) <= max(abs_tol, rel_tol * max(abs(a), abs(b), 1.0))
 
 
@@ -279,6 +308,71 @@ def row_num(row: Dict[str, str], col: Optional[str]) -> Optional[float]:
     return parse_number(row.get(col)) if col else None
 
 
+FINANCIAL_NUMBER_COLUMNS = {
+    "amount": """revenue sales 收入 营收 gross_profit grossprofit 毛利 operating_income operatingincome ebit 营业利润 经营利润
+        net_income netincome 净利润 cfo operating_cash_flow cash_from_operations 经营现金流 capex capital_expenditure capitalexpenditure 资本开支
+        fcf free_cash_flow freecashflow 自由现金流 eps diluted_eps 每股收益 cash_begin beginning_cash 期初现金 cash_end ending_cash 期末现金
+        cfi investing_cash_flow 投资现金流 cff financing_cash_flow 融资现金流 total_assets totalassets 总资产 receivables accounts_receivable 应收账款 应收
+        deferred_revenue contract_liabilities 递延收入 合同负债 ppe net_ppe 固定资产 current_assets 流动资产 depreciation 折旧
+        sga sg_a 销售管理费用 total_liabilities totalliabilities 总负债 average_total_assets avg_total_assets 平均总资产""".split(),
+    "shares": "shares diluted_shares share_count 股本 稀释股数".split(),
+    "ratio": """gross_margin grossmargin 毛利率 operating_margin operatingmargin 营业利润率 经营利润率 net_margin netmargin 净利率
+        fcf_margin fcfmargin 自由现金流率 revenue_yoy yoy_revenue 营收同比 revenue_qoq qoq_revenue 营收环比""".split(),
+}
+
+
+class FinancialRow(dict):
+    """Parsed cells retain their original values for validation diagnostics."""
+
+    def __init__(self, raw, row_number):
+        super().__init__(raw)
+        self.raw = raw
+        self.row_number = row_number
+
+
+def prepare_financial_rows(rows, aliases, path, issues):
+    kinds = {norm_key(name): kind for kind, names in FINANCIAL_NUMBER_COLUMNS.items() for name in names}
+    numeric_cols = {col: kinds[key] for key, col in aliases.items() if key in kinds}
+    result = []
+    for row_number, raw in enumerate(rows, 2):
+        row = FinancialRow(raw, row_number)
+        for col, kind in numeric_cols.items():
+            value = raw.get(col)
+            try:
+                parsed = parse_number(value)
+                if parsed is not None and isinstance(value, str):
+                    token = unicodedata.normalize("NFKC", value).strip().strip("()").strip()
+                    unit = re.search(r"(%|倍|[xXkKmMbB]|万亿|亿|万|千|元|股)$", token)
+                    suffix = unit[0] if unit else ""
+                    currency = any(symbol in token for symbol in "$¥")
+                    if ((kind == "amount" and suffix in {"%", "倍", "x", "X", "股"})
+                            or (kind == "shares" and (currency or suffix in {"%", "倍", "x", "X", "元"}))
+                            or (kind == "ratio" and (currency or suffix not in {"", "%", "倍", "x", "X"}))):
+                        raise ValueError("数值单位与财务列的金额/股数/比率口径冲突")
+                row[col] = parsed
+            except ValueError as exc:
+                add(issues, "P1", "FINANCIALS_INVALID_NUMBER", "财务数值无效；相关单元格不参与计算。",
+                    f"row={row_number}, column={col!r}, raw={value!r}: {exc}", path)
+                row[col] = None
+        result.append(row)
+    return result
+
+
+def financial_inputs(rows, columns):
+    return "; ".join(
+        f"row={getattr(row, 'row_number', '?')}, column={col!r}, raw={getattr(row, 'raw', row).get(col)!r}"
+        for row in rows for col in dict.fromkeys(columns) if col is not None
+    )
+
+
+def finite_result(value, issues, path, expression, rows, columns):
+    if math.isfinite(value):
+        return value
+    add(issues, "P1", "FINANCIALS_NONFINITE_RESULT", "财务计算结果不是有限数值，未作正常结果或风险判读。",
+        f"expression={expression}; {financial_inputs(rows, columns)}", path)
+    return None
+
+
 def check_report(
     path: str,
     assumptions: Optional[Dict],
@@ -398,9 +492,15 @@ def check_model_report_markers(text: str, assumptions: Optional[Dict], path: str
 
 def check_valuation_labels(text: str, assumptions: Optional[Dict], path: str, issues: List[Issue]) -> None:
     if assumptions:
-        price = parse_number(assumptions.get("price"))
-        lo = parse_number(assumptions.get("range_low"))
-        hi = parse_number(assumptions.get("range_high"))
+        values = {}
+        for name in ("price", "range_low", "range_high"):
+            try:
+                values[name] = parse_number(assumptions.get(name))
+            except ValueError as exc:
+                add(issues, "P1", "REPORT_INVALID_VALUATION_NUMBER", "估值标签所需数值无效。",
+                    f"field={name}, raw={assumptions.get(name)!r}: {exc}", path)
+                values[name] = None
+        price, lo, hi = (values[name] for name in ("price", "range_low", "range_high"))
         if price is not None and lo is not None and hi is not None and hi >= lo:
             expected = calibrate(price, lo, hi)
             found_labels = detect_labels(text)
@@ -430,7 +530,7 @@ def check_assumptions(path: str, issues: List[Issue], require_review: bool = Fal
 
     def numeric(block, key, context, required=False, positive=False):
         value = block.get(key)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        if not is_finite_number(value):
             if required or key in block:
                 add(issues, "P1", "ASSUMPTION_INVALID_NUMBER", f"{context}.{key} 必须是有限 JSON 数值，不能是字符串或布尔值。", file=path)
             return None
@@ -553,8 +653,17 @@ def check_assumptions(path: str, issues: List[Issue], require_review: bool = Fal
         else:
             equity_basis(epv, "epv")
         debt = epv.get("net_debt", 0)
-        if basis in {"NET_INCOME", "NI"} and isinstance(debt, (int, float)) and not isinstance(debt, bool) and math.isfinite(debt) and debt != 0:
+        if basis in {"NET_INCOME", "NI"} and is_finite_number(debt) and debt != 0:
             add(issues, "P1", "EPV_EQUITY_DEBT_DOUBLE_COUNT", "净利润 EPV 已为权益价值，不得再次扣净债。", file=path)
+        if "asset_series" in epv:
+            try:
+                try:
+                    from dcf import epv_asset_history
+                except ModuleNotFoundError:
+                    from scripts.dcf import epv_asset_history
+                epv_asset_history(epv)
+            except (SystemExit, ValueError, ArithmeticError) as exc:
+                add(issues, "P1", "EPV_ASSET_HISTORY_INVALID", "EPV 历史资产比较缺少可用且一致的权益口径。", str(exc), path)
         growth = epv.get("growth") or {}
         if not isinstance(growth, dict):
             add(issues, "P1", "ASSUMPTION_MODEL_INVALID", "epv.growth 必须是对象。", file=path)
@@ -619,7 +728,9 @@ def check_ratio(
     provided = row_num(row, provided_col)
     if num is None or den in (None, 0) or provided is None:
         return
-    expected = num / den
+    expected = finite_result(num / den, issues, path, name, [row], [numerator_col, denominator_col, provided_col])
+    if expected is None:
+        return
     if abs(expected - provided) > tolerance:
         add(
             issues,
@@ -714,7 +825,9 @@ def check_growth(
             add(issues, "P2", "FINANCIALS_GROWTH_UNCHECKED", f"{label} 的{name}未复核：缺少准确的可比期或可用数值。",
                 f"required_period={prior_key}", path)
             continue
-        expected = cur / prev - 1
+        expected = finite_result(cur / prev - 1, issues, path, name, [row, prior], [value_col, provided_col])
+        if expected is None:
+            continue
         if abs(expected - provided) > 0.015:
             add(
                 issues,
@@ -807,16 +920,18 @@ def check_forensics(rows, aliases, path, issues, period_index=None, industries=N
         prior = actual_index.get(("annual", key[1] - 1, 1))
         prior_assets = row_num(prior, ta) if prior is not None else None
         if assets is None and ta_v is not None and prior_assets is not None:
-            assets = (ta_v + prior_assets) / 2
+            assets = ta_v / 2 + prior_assets / 2
         if ni_v is not None and cfo_v is not None and assets is not None and assets > 0:
-            accr = (ni_v - cfo_v) / assets
-            if accr > 0.10:
+            accr = finite_result((ni_v - cfo_v) / assets, issues, path, "总应计比率", [row] + ([prior] if prior is not None else []), [ni, cfo, ta, avg_assets])
+            if accr is not None and accr > 0.10:
                 risk("P1", "FORENSIC_HIGH_ACCRUALS", f"{label} 总应计比率 {accr:.1%} > 10%，盈利质量红旗；须人工核查并落实可信度评级和动作约束。",
                      f"net_income={ni_v}, cfo={cfo_v}, average_total_assets={assets}")
-            elif accr > 0.05:
+            elif accr is not None and accr > 0.05:
                 risk("P2", "FORENSIC_ELEVATED_ACCRUALS", f"{label} 总应计比率 {accr:.1%} 偏高（5–10%）；须核查原因。")
         if ni_v not in (None, 0) and cfo_v is not None and ni_v > 0:
-            conv_series.append((key[1], label, cfo_v / ni_v))
+            conversion = finite_result(cfo_v / ni_v, issues, path, "现金转化率", [row], [cfo, ni])
+            if conversion is not None:
+                conv_series.append((key[1], label, conversion))
     if ni and cfo and ta and not any(row_num(row, avg_assets) is not None or ("annual", key[1] - 1, 1) in actual_index
                                    for key, row in zip(annual_keys, annual_rows)):
         add(issues, "P2", "FORENSIC_ACCRUALS_UNCHECKED", "应计筛查缺少平均总资产或相邻年度期末资产，未用单一期末资产代替。", file=path)
@@ -834,14 +949,19 @@ def check_forensics(rows, aliases, path, issues, period_index=None, industries=N
     p = actual_index.get(("annual", latest[1] - 1, 1))
     # -- DSO / 递延收入 与收入增速背离（最新年度与上一年度） --
     if p is not None and rev:
-        r_g = growth_rate(row_num(t, rev), row_num(p, rev))
+        def growth(col):
+            value = growth_rate(row_num(t, col), row_num(p, col))
+            return finite_result(value, issues, path, f"{col} 同比", [t, p], [col]) if value is not None else None
+
+        r_g = growth(rev)
         if rec:
-            rec_g = growth_rate(row_num(t, rec), row_num(p, rec))
-            if r_g is not None and rec_g is not None and rec_g - r_g > 0.15:
+            rec_g = growth(rec)
+            divergence = finite_result(rec_g - r_g, issues, path, "应收与收入增速差", [t, p], [rev, rec]) if r_g is not None and rec_g is not None else None
+            if divergence is not None and divergence > 0.15:
                 risk("P2", "FORENSIC_DSO_DIVERGENCE",
                      f"应收增速 {rec_g:.0%} 超收入增速 {r_g:.0%} 逾 15pp，警惕塞货/放宽信用/提前确认。")
         if dfr:
-            d_g = growth_rate(row_num(t, dfr), row_num(p, dfr))
+            d_g = growth(dfr)
             if r_g is not None and d_g is not None and r_g > 0 and d_g < 0:
                 risk("P2", "FORENSIC_DEFERRED_DIVERGENCE",
                      f"收入增长 {r_g:.0%} 而递延收入下降 {d_g:.0%}，订阅型公司需核查是否透支未来。")
@@ -855,20 +975,32 @@ def check_forensics(rows, aliases, path, issues, period_index=None, industries=N
             def v(row, col):
                 x = row_num(row, col)
                 if x is None:
-                    raise ValueError(col)
+                    raise ValueError(f"{col} 缺失或无效")
                 return x
-            dsri = (v(t, rec) / v(t, rev)) / (v(p, rec) / v(p, rev))
-            gmi = (v(p, gp) / v(p, rev)) / (v(t, gp) / v(t, rev))
-            aqi_t = 1 - (v(t, ca) + v(t, ppe)) / v(t, ta)
-            aqi_p = 1 - (v(p, ca) + v(p, ppe)) / v(p, ta)
-            aqi = aqi_t / aqi_p if aqi_p else 1.0
-            sgi = v(t, rev) / v(p, rev)
-            depi = (v(p, dep) / (v(p, dep) + v(p, ppe))) / (v(t, dep) / (v(t, dep) + v(t, ppe)))
-            sgai = (v(t, sga) / v(t, rev)) / (v(p, sga) / v(p, rev))
-            tata = (v(t, ni) - v(t, cfo)) / v(t, ta)
-            lvgi = (v(t, tl) / v(t, ta)) / (v(p, tl) / v(p, ta))
-            m = (-4.84 + 0.92 * dsri + 0.528 * gmi + 0.404 * aqi + 0.892 * sgi
-                 + 0.115 * depi - 0.172 * sgai + 4.679 * tata - 0.327 * lvgi)
+
+            def checked(name, value):
+                if not math.isfinite(value):
+                    raise ArithmeticError(f"{name} 产生非有限值")
+                return value
+
+            def ratio(name, numerator, denominator):
+                if denominator == 0:
+                    raise ValueError(f"{name} 分母为零")
+                return checked(name, numerator / denominator)
+
+            dsri = ratio("DSRI", ratio("本期应收/收入", v(t, rec), v(t, rev)), ratio("前期应收/收入", v(p, rec), v(p, rev)))
+            gmi = ratio("GMI", ratio("前期毛利率", v(p, gp), v(p, rev)), ratio("本期毛利率", v(t, gp), v(t, rev)))
+            aqi_t = checked("本期相关资产占比", 1 - ratio("本期流动及固定资产占比", checked("本期流动资产+PPE", v(t, ca) + v(t, ppe)), v(t, ta)))
+            aqi_p = checked("前期相关资产占比", 1 - ratio("前期流动及固定资产占比", checked("前期流动资产+PPE", v(p, ca) + v(p, ppe)), v(p, ta)))
+            aqi = ratio("AQI（前期相关资产占比）", aqi_t, aqi_p)
+            sgi = ratio("SGI", v(t, rev), v(p, rev))
+            depi = ratio("DEPI", ratio("前期折旧率", v(p, dep), checked("前期折旧+PPE", v(p, dep) + v(p, ppe))),
+                         ratio("本期折旧率", v(t, dep), checked("本期折旧+PPE", v(t, dep) + v(t, ppe))))
+            sgai = ratio("SGAI", ratio("本期销售管理费用率", v(t, sga), v(t, rev)), ratio("前期销售管理费用率", v(p, sga), v(p, rev)))
+            tata = ratio("TATA", checked("净利润-CFO", v(t, ni) - v(t, cfo)), v(t, ta))
+            lvgi = ratio("LVGI", ratio("本期杠杆率", v(t, tl), v(t, ta)), ratio("前期杠杆率", v(p, tl), v(p, ta)))
+            m = checked("M-Score", -4.84 + 0.92 * dsri + 0.528 * gmi + 0.404 * aqi + 0.892 * sgi
+                        + 0.115 * depi - 0.172 * sgai + 4.679 * tata - 0.327 * lvgi)
             detail = (f"M={m:.2f} | DSRI={dsri:.2f} GMI={gmi:.2f} AQI={aqi:.2f} SGI={sgi:.2f} "
                       f"DEPI={depi:.2f} SGAI={sgai:.2f} TATA={tata:.3f} LVGI={lvgi:.2f}")
             if m > -1.78:
@@ -876,8 +1008,12 @@ def check_forensics(rows, aliases, path, issues, period_index=None, industries=N
                      f"Beneish M-Score = {m:.2f} > -1.78，落入盈余操纵可疑区；须逐项核查并落实 C/D 评级动作约束。", detail)
             else:
                 add(issues, "P3", "FORENSIC_MSCORE_INFO", f"Beneish M-Score = {m:.2f}（阈值 -1.78，未越限）。", detail, path)
-        except (ValueError, ZeroDivisionError):
-            add(issues, "P3", "FORENSIC_MSCORE_SKIPPED", "M-Score 所需列存在但含缺失/零值，跳过计算。", "", path)
+        except ValueError as exc:
+            add(issues, "P2", "FORENSIC_MSCORE_SKIPPED", "M-Score 不可计算，不能判为未越限，也不填补中性指标。",
+                f"{exc}; {financial_inputs([p, t], needed)}", path)
+        except ArithmeticError as exc:
+            add(issues, "P1", "FINANCIALS_NONFINITE_RESULT", "M-Score 计算产生非有限值，未生成评分或正常判读。",
+                f"{exc}; {financial_inputs([p, t], needed)}", path)
 
 
 def check_financials(path: str, issues: List[Issue], industries: Optional[Sequence[str]] = None) -> None:
@@ -885,6 +1021,7 @@ def check_financials(path: str, issues: List[Issue], industries: Optional[Sequen
     if not rows:
         add(issues, "P1", "FINANCIALS_EMPTY", "财务 CSV 没有数据行。", file=path)
         return
+    rows = prepare_financial_rows(rows, aliases, path, issues)
 
     period = pick(aliases, ["period", "fiscal_period", "date", "财期", "期间"])
     revenue = pick(aliases, ["revenue", "sales", "收入", "营收"])
@@ -923,16 +1060,16 @@ def check_financials(path: str, issues: List[Issue], industries: Optional[Sequen
         capex_v = row_num(row, capex)
         fcf_v = row_num(row, fcf)
         if cfo_v is not None and capex_v is not None and fcf_v is not None:
-            expected = cfo_v - abs(capex_v) if capex_v >= 0 else cfo_v + capex_v
-            if not close_enough(expected, fcf_v):
+            expected = finite_result(cfo_v - abs(capex_v), issues, path, "CFO-Capex", [row], [cfo, capex, fcf])
+            if expected is not None and not close_enough(expected, fcf_v):
                 add(issues, "P1", "FCF_RECONCILIATION_MISMATCH", f"{label} 的 FCF 与 CFO/Capex 不一致。", f"expected={expected}, provided={fcf_v}, cfo={cfo_v}, capex={capex_v}", path)
 
         net_income_v = row_num(row, net_income)
         shares_v = row_num(row, shares)
         eps_v = row_num(row, eps)
         if net_income_v is not None and shares_v not in (None, 0) and eps_v is not None:
-            expected = net_income_v / shares_v
-            if not close_enough(expected, eps_v, rel_tol=0.025, abs_tol=0.03):
+            expected = finite_result(net_income_v / shares_v, issues, path, "净利润/股本", [row], [net_income, shares, eps])
+            if expected is not None and not close_enough(expected, eps_v, rel_tol=0.025, abs_tol=0.03):
                 add(issues, "P2", "EPS_RECONCILIATION_MISMATCH", f"{label} 的 EPS 与净利润/股本不一致，请确认单位。", f"expected={expected}, provided={eps_v}, net_income={net_income_v}, shares={shares_v}", path)
 
         if cash_begin and cash_end and cfo and cfi and cff:
@@ -942,8 +1079,8 @@ def check_financials(path: str, issues: List[Issue], industries: Optional[Sequen
             cfi_v = row_num(row, cfi)
             cff_v = row_num(row, cff)
             if None not in (cb, ce, cfo_v, cfi_v, cff_v):
-                expected = cb + cfo_v + cfi_v + cff_v
-                if not close_enough(expected, ce):
+                expected = finite_result(cb + cfo_v + cfi_v + cff_v, issues, path, "现金流量表勾稽", [row], [cash_begin, cash_end, cfo, cfi, cff])
+                if expected is not None and not close_enough(expected, ce):
                     add(issues, "P1", "CASH_FLOW_ROLL_FORWARD_MISMATCH", f"{label} 的现金流量表勾稽不一致。", f"expected_ending_cash={expected}, provided={ce}", path)
 
     period_index = financial_period_index(rows, period, path, issues)

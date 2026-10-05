@@ -103,7 +103,10 @@ class LimitedLiabilityTests(unittest.TestCase):
         self.assertAlmostEqual(25., result['raw_mean_per_share'])
         self.assertEqual(0., result['p10'])
         self.assertAlmostEqual(100., result['p90'])
-        self.assertEqual(.5, result['p_loss'])
+        self.assertEqual(.5, result['p_value_below_price'])
+        self.assertEqual(result['p_value_below_price'], result['p_loss'])
+        self.assertIn('P(模型内在价值 < 现价', output)
+        self.assertNotIn('买入是错误', output)
         self.assertEqual(1, result['equity_shortfall_count'])
         self.assertAlmostEqual(-50., result['min_raw_equity'])
         self.assertAlmostEqual(25., result['mean_equity_shortfall'])
@@ -207,6 +210,68 @@ class BasisAndBridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             quiet(DCF.run_epv, dict(c, net_debt=20.))
 
+    def test_epv_history_matches_current_equity_and_uses_each_period_debt(self):
+        c = {'normalized_earnings': 10., 'coc': .1, 'shares': 1.,
+             'net_debt': 50., 'asset_value': 50., 'asset_series': [
+                 {'period': 'same', 'normalized_earnings': 10., 'asset_value': 50., 'net_debt': 50.},
+                 {'period': 'less debt', 'normalized_earnings': 10., 'asset_value': 50., 'net_debt': 20.},
+                 {'period': 'lower cost', 'normalized_earnings': 10., 'asset_value': 50.,
+                  'net_debt': 50., 'coc': .05}]}
+        result, output = quiet(DCF.run_epv, c)
+        self.assertEqual(1., result['asset_ratio'])
+        self.assertEqual(result['asset_ratio'], result['asset_series'][0]['ratio'])
+        self.assertEqual(1.6, result['asset_series'][1]['ratio'])
+        self.assertEqual(3., result['asset_series'][2]['ratio'])
+        self.assertIn('未填 coc 的期间沿用 WACC 10.00%', output)
+
+    def test_epv_history_preserves_shortfall_and_floors_equity(self):
+        c = {'normalized_earnings': 10., 'coc': .1, 'shares': 1.,
+             'asset_series': [{'period': 'insolvent', 'normalized_earnings': 10.,
+                               'asset_value': 50., 'net_debt': 150.}]}
+        result, output = quiet(DCF.run_epv, c)
+        row = result['asset_series'][0]
+        self.assertEqual(-50., row['raw_equity'])
+        self.assertEqual(50., row['equity_shortfall'])
+        self.assertEqual(0., row['ratio'])
+        self.assertIn('insolvent：原始权益 -50.00', output)
+
+    def test_equity_epv_history_never_deducts_debt_again(self):
+        row = {'period': 'same', 'normalized_earnings': 10., 'asset_value': 50.}
+        c = {'earnings_basis': 'NET_INCOME', 'normalized_earnings': 10., 'coc': .1,
+             'shares': 1., 'asset_value': 50., 'asset_series': [row]}
+        result, _ = quiet(DCF.run_epv, c)
+        self.assertEqual(2., result['asset_ratio'])
+        self.assertEqual(result['asset_ratio'], result['asset_series'][0]['ratio'])
+        self.assertIsNone(result['asset_series'][0]['ev'])
+        row['net_debt'] = 50.
+        with self.assertRaisesRegex(ValueError, '不得再次减净债'):
+            quiet(DCF.run_epv, c)
+
+    def test_epv_history_requires_explicit_historical_financing(self):
+        c = {'normalized_earnings': 10., 'coc': .1, 'shares': 1., 'net_debt': 50.}
+        for row in (['past', 10., 50.],
+                    {'period': 'past', 'normalized_earnings': 10., 'asset_value': 50.}):
+            with self.subTest(row=row), self.assertRaisesRegex(ValueError, 'net_debt'):
+                quiet(DCF.run_epv, dict(c, asset_series=[row]))
+
+    def test_epv_history_rejects_invalid_or_mixed_period_inputs(self):
+        row = {'period': 'past', 'normalized_earnings': 10., 'asset_value': 50., 'net_debt': 50.}
+        c = {'normalized_earnings': 10., 'coc': .1, 'shares': 1.}
+        for change in ({'period': ''}, {'normalized_earnings': math.nan}, {'asset_value': 0.},
+                       {'net_debt': math.inf}, {'coc': 0.}, {'earnings_basis': 'NET_INCOME'},
+                       {'discount_rate_basis': 'COE'}, {'excess_cash': 10.}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                quiet(DCF.run_epv, dict(c, asset_series=[dict(row, **change)]))
+        with self.assertRaises(ValueError):
+            quiet(DCF.run_epv, dict(c, asset_series={}))
+
+    def test_epv_derived_ratios_and_per_share_values_must_remain_finite(self):
+        c = {'normalized_earnings': 10., 'coc': .1, 'shares': 1.}
+        row = {'period': 'past', 'normalized_earnings': 10., 'asset_value': 1e-309, 'net_debt': 0.}
+        for change in ({'asset_value': 1e-309}, {'shares': 1e-309}, {'asset_series': [row]}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, '有限数字'):
+                quiet(DCF.run_epv, dict(c, **change))
+
     def test_pvgo_never_inherits_wacc(self):
         c = {"earnings_ps": 5., "price": 100.}
         with self.assertRaisesRegex(ValueError, "CoE"):
@@ -287,6 +352,37 @@ class ReverseAndRolesTests(unittest.TestCase):
         self.assertNotIn("概率加权公允价值:", output)
         self.assertNotIn("=== 仓位思维 ===", output)
 
+    def test_zero_probability_extremes_never_change_position_metrics(self):
+        cfg = {'price': 100., 'scenarios': [{'name': 'up', 'prob': .5}, {'name': 'down', 'prob': .5}]}
+        results = {'up': {'per_share': 120.}, 'down': {'per_share': 80.}}
+        _, baseline = quiet(DCF.run_position, results, cfg)
+        self.assertIn('不对称比 1.0（<1.5', baseline)
+        for value in (160., 0.):
+            changed_cfg = copy.deepcopy(cfg)
+            changed_cfg['scenarios'].append({'name': 'impossible', 'prob': 0.})
+            changed_results = dict(results, impossible={'per_share': value})
+            _, output = quiet(DCF.run_position, changed_results, changed_cfg)
+            with self.subTest(value=value):
+                self.assertEqual(baseline, output)
+
+    def test_valuation_only_action_keeps_values_without_automatic_position_output(self):
+        cfg = self.config()
+        baseline, legacy_output = quiet(DCF.run, cfg)
+        self.assertIn('=== 仓位思维 ===', legacy_output)
+        cfg['research_review'] = {'decision': {'action': 'none'}}
+        result, output = quiet(DCF.run, cfg)
+        self.assertEqual(baseline, result)
+        self.assertIn('概率加权公允价值: 100.0/股', output)
+        self.assertNotIn('=== 仓位思维 ===', output)
+        _, explicit_output = quiet(DCF.run_position, result, cfg)
+        self.assertIn('=== 仓位思维 ===', explicit_output)
+
+    def test_position_rejects_invalid_probabilities_before_filtering(self):
+        cfg = {'price': 100., 'scenarios': [{'name': 'up', 'prob': 1.1}, {'name': 'down', 'prob': -.1}]}
+        results = {'up': {'per_share': 120.}, 'down': {'per_share': 80.}}
+        with self.assertRaisesRegex(ValueError, '概率必须在'):
+            quiet(DCF.run_position, results, cfg)
+
     def test_decision_probabilities_must_sum_to_one(self):
         cfg = self.config()
         cfg["scenarios"][0]["prob"] = .5
@@ -323,6 +419,18 @@ class ValidationTests(unittest.TestCase):
         for sc in scenarios:
             with self.subTest(sc=sc), self.assertRaises(ValueError):
                 DCF.dcf_value(sc, .1, 0., 1., 0.)
+
+    def test_montecarlo_spec_resolves_defaults_independently_of_sampling_precision(self):
+        cfg = copy.deepcopy(DCF.DEMO)
+        c = cfg['montecarlo']
+        spec = DCF.montecarlo_spec(c, cfg)
+        explicit = dict(c, wacc_low=cfg['wacc'] - .01, wacc_high=cfg['wacc'] + .01,
+                        terminal_g=cfg['terminal_g'], fade_years=5, n=10, seed=99)
+        self.assertEqual(spec, DCF.montecarlo_spec(explicit, cfg))
+        self.assertEqual('clipped_normal_3sigma', spec['growth_distribution'])
+        self.assertEqual('independent_constant_growth_and_margin', spec['sampling'])
+        c['margin_high'] += .2
+        self.assertNotEqual(spec, DCF.montecarlo_spec(c, cfg))
 
     def test_invalid_montecarlo_bounds_not_silently_adjusted(self):
         cfg = copy.deepcopy(DCF.DEMO)

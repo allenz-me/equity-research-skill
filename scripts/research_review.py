@@ -6,6 +6,12 @@ module deliberately has no report-text heuristics or third-party dependencies.
 
 from datetime import date
 import math
+from statistics import NormalDist
+
+if __package__:
+    from .dcf import montecarlo_spec, scenario_fcfs
+else:
+    from dcf import montecarlo_spec, scenario_fcfs
 
 
 def number(value):
@@ -23,6 +29,48 @@ def same(a, b):
 
 def numeric_value(value):
     return number(value) or (isinstance(value, list) and bool(value) and all(number(v) for v in value))
+
+
+def same_record(actual, recorded):
+    """Compare complete snapshots, including their field set and distribution names."""
+    if isinstance(actual, dict) and isinstance(recorded, dict):
+        return actual.keys() == recorded.keys() and all(same_record(v, recorded[k]) for k, v in actual.items())
+    if number(actual):
+        return same(actual, recorded)
+    return type(actual) is type(recorded) and actual == recorded
+
+
+def montecarlo_summary(spec):
+    """Exact marginal moments and tails for the calculator's fixed distributions.
+
+    These are input-distribution statistics, not a forecast of realized returns.
+    Normal draws are clipped at three sigma, not redrawn from a truncated normal.
+    """
+    low, mode, high = (spec[k] for k in ('margin_low', 'margin_mode', 'margin_high'))
+
+    def triangular_quantile(p):
+        if low == high:
+            return low
+        split = (mode - low) / (high - low)
+        if p <= split:
+            return low + math.sqrt(p * (high - low) * (mode - low))
+        return high - math.sqrt((1 - p) * (high - low) * (high - mode))
+
+    gm, gs = spec['growth_mean'], spec['growth_std']
+    wl, wh = spec['wacc_low'], spec['wacc_high']
+    result = {
+        'growth_mean': gm, 'growth_low': gm - 3 * gs, 'growth_high': gm + 3 * gs,
+        'growth_p10': gm + NormalDist().inv_cdf(.1) * gs,
+        'growth_p90': gm + NormalDist().inv_cdf(.9) * gs,
+        'margin_mean': low / 3 + mode / 3 + high / 3,
+        'margin_low': low, 'margin_high': high,
+        'margin_p10': triangular_quantile(.1), 'margin_p90': triangular_quantile(.9),
+        'wacc_mean': wl / 2 + wh / 2, 'wacc_low': wl, 'wacc_high': wh,
+        'wacc_p10': wl + .1 * (wh - wl), 'wacc_p90': wl + .9 * (wh - wl),
+    }
+    if not all(number(v) for v in result.values()):
+        raise ValueError('distribution statistics must be finite')
+    return result
 
 
 def uplift(assumed, conservative):
@@ -107,6 +155,30 @@ def review_issues(cfg, require_review=False):
             issue('REVIEW_SOURCE_UNLINKED', '证据未关联到有效来源记录。', context)
             return False
         return True
+
+    def check_benchmark(benchmark, context, requires_growth=False):
+        """Apply the same provenance/cohort bar to scalar and distribution claims."""
+        if not isinstance(benchmark, dict):
+            issue('REVIEW_BENCHMARK_MISSING', '需披露保守参照及其适用限制。', str(context))
+            benchmark = {}
+        cited(benchmark, f'{context}: benchmark')
+        if not text(benchmark.get('description')) or not text(benchmark.get('limitations')):
+            issue('REVIEW_BENCHMARK_MISSING', '参照组需要描述及匹配限制。', str(context))
+        if requires_growth:
+            for field in ('industry', 'scale', 'business_model', 'stage', 'order_visibility'):
+                if not text(benchmark.get(field)):
+                    issue('REVIEW_COHORT_INCOMPLETE', '增长参照需说明行业、规模、模式、阶段及订单可见度。', f'{context}: {field}')
+        percentile = benchmark.get('percentile')
+        if percentile is not None:
+            distribution = benchmark.get('distribution')
+            if not number(percentile) or not 0 <= percentile <= 100 or not isinstance(distribution, dict):
+                issue('REVIEW_UNSUPPORTED_PERCENTILE', '具体分位必须有可追溯分布；无分布请用 null。', str(context))
+            else:
+                size = distribution.get('sample_size')
+                if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or any(
+                    not text(distribution.get(k)) for k in ('dataset', 'period', 'metric')):
+                    issue('REVIEW_UNSUPPORTED_PERCENTILE', '分位缺少数据集、样本量、样本期间或指标口径。', str(context))
+                cited(distribution, f'{context}: distribution')
 
     baseline = review.get('baseline')
     if not isinstance(baseline, dict):
@@ -238,6 +310,101 @@ def review_issues(cfg, require_review=False):
                 if pointer not in valid_models:
                     issue('REVIEW_WEIGHTED_MODEL_OMITTED', '带决策概率的情景不能从证据复核中遗漏。', pointer)
 
+    # Cash-flow recovery must start at actual FCFF, not at the first forecast.
+    cash_baseline = baseline.get('cash_flow')
+    cash_models = any(p.startswith('/scenarios/') or p == '/montecarlo' for p in valid_models)
+    cash_valid = isinstance(cash_baseline, dict)
+    cash_fields = ('revenue', 'nopat', 'da', 'capex', 'change_nwc', 'fcff')
+    if cash_models:
+        if not cash_valid or cash_baseline.get('actual') is not True or not all(
+                number(cash_baseline.get(k)) for k in cash_fields):
+            issue('REVIEW_CASH_BASELINE_MISSING', 'DCF/蒙特卡洛决策模型需提供实际收入与可复算的 FCFF 基线。')
+            cash_valid = False
+        else:
+            cited(cash_baseline, 'baseline.cash_flow')
+            if cash_baseline['revenue'] <= 0 or cash_baseline['da'] < 0 or cash_baseline['capex'] < 0:
+                issue('REVIEW_CASH_BASELINE_INVALID', 'FCFF 基线需正收入、非负折旧摊销与资本开支；不适用时另建人工复核模型。')
+                cash_valid = False
+            expected = cash_baseline['nopat'] + cash_baseline['da'] - cash_baseline['capex'] - cash_baseline['change_nwc']
+            if not same(expected, cash_baseline['fcff']) or (
+                    earnings_basis(baseline.get('earnings_basis')) == 'NOPAT' and not same(cash_baseline['nopat'], annual)):
+                issue('REVIEW_CASH_BASELINE_MISMATCH', '实际 FCFF 必须等于 NOPAT＋折旧摊销－全部资本开支－营运资本增加，并与 NOPAT 盈利基线勾稽。')
+                cash_valid = False
+            if cash_valid and not all(number(cash_baseline[k] / cash_baseline['revenue']) for k in ('fcff', 'nopat')):
+                issue('REVIEW_CASH_BASELINE_INVALID', '实际 FCFF/NOPAT 利润率必须可计算且有限。')
+                cash_valid = False
+
+    def improving(path, actual):
+        return isinstance(path, list) and bool(path) and all(number(v) for v in path) and (
+            any(v > actual + 1e-6 for v in path) or any(b > a + 1e-6 for a, b in zip(path, path[1:])))
+
+    required_cash_claims, actual_uplifts, cash_claim_kinds = set(), set(), {}
+    for pointer in valid_models:
+        if not pointer.startswith('/scenarios/'):
+            continue
+        block = resolve_pointer(cfg, pointer)
+        if number(block.get('fade_g_start')) and block['fade_g_start'] > 0 and block.get('fade_years', 0):
+            actual_uplifts.add(f'{pointer}/fade_g_start')
+        if 'fcf' in block:
+            bridge = block.get('operating_bridge')
+            fields = ('revenue', 'nopat_margin', 'da', 'capex', 'change_nwc')
+            fcfs = block.get('fcf')
+            valid = isinstance(bridge, dict) and isinstance(fcfs, list) and bool(fcfs) and all(number(v) for v in fcfs)
+            valid = valid and all(isinstance(bridge.get(k), list) and len(bridge[k]) == len(fcfs) and
+                                  all(number(v) for v in bridge[k]) for k in fields)
+            if not valid:
+                issue('REVIEW_FCFF_BRIDGE_MISSING', '直接输入 FCF 的决策情景需提供等长收入、NOPAT 利润率、折旧摊销、资本开支、营运资本增加数组。', pointer)
+                continue
+            cited(bridge, f'{pointer}/operating_bridge')
+            revenues = bridge['revenue']
+            if any(v <= 0 for v in revenues) or any(v < 0 for k in ('da', 'capex') for v in bridge[k]):
+                issue('REVIEW_FCFF_BRIDGE_INVALID', '经营桥需正收入、非负折旧摊销和资本开支。', pointer)
+                continue
+            bridged = [r * m + d - c - w for r, m, d, c, w in zip(*(bridge[k] for k in fields))]
+            if not same(bridged, fcfs):
+                issue('REVIEW_FCFF_BRIDGE_MISMATCH', '经营桥 NOPAT＋折旧摊销－全部资本开支－营运资本增加必须逐期等于模型 FCF。', pointer)
+            revenue_parameter = f'{pointer}/operating_bridge/revenue'
+            margin_parameter = f'{pointer}/operating_bridge/nopat_margin'
+            required_cash_claims.update((revenue_parameter, margin_parameter))
+            cash_claim_kinds.update({revenue_parameter: 'growth_persistence', margin_parameter: 'earnings_recovery'})
+            if cash_valid:
+                if improving(revenues, cash_baseline['revenue']):
+                    actual_uplifts.add(revenue_parameter)
+                if improving(bridge['nopat_margin'], cash_baseline['nopat'] / cash_baseline['revenue']):
+                    actual_uplifts.add(margin_parameter)
+                fcff_margins = [f / r for f, r in zip(fcfs, revenues)]
+                if not all(number(v) for v in fcff_margins):
+                    issue('REVIEW_FCFF_BRIDGE_INVALID', '桥接隐含 FCFF 利润率必须为有限数字。', pointer)
+                if improving(fcfs, cash_baseline['fcff']) or improving(fcff_margins, cash_baseline['fcff'] / cash_baseline['revenue']):
+                    actual_uplifts.add(f'{pointer}/fcf')
+        else:
+            revenue_parameter, margin_parameter = f'{pointer}/revenue', f'{pointer}/fcf_margin'
+            required_cash_claims.add(margin_parameter)
+            cash_claim_kinds.update({revenue_parameter: 'growth_persistence', margin_parameter: 'earnings_recovery'})
+            if cash_valid:
+                if improving(block.get('revenue'), cash_baseline['revenue']):
+                    actual_uplifts.add(revenue_parameter)
+                if improving(block.get('fcf_margin'), cash_baseline['fcff'] / cash_baseline['revenue']):
+                    actual_uplifts.add(margin_parameter)
+
+    if any(p.startswith('/scenarios/') for p in valid_models) and number(cfg.get('terminal_g')) and cfg['terminal_g'] > 0:
+        actual_uplifts.add('/terminal_g')
+
+    def supported_evidence(record, context):
+        evidence = record.get('evidence', {})
+        if not isinstance(evidence, dict):
+            evidence = {}
+        for category in ('business', 'cash_flow', 'competition'):
+            observations = evidence.get(category)
+            if not isinstance(observations, list) or not observations:
+                issue('REVIEW_EVIDENCE_MISSING', '支持有利假设需提供业务、现金流及竞争证据，强度标签不能替代。', f'{context}: {category}')
+                continue
+            for observation in observations:
+                if not isinstance(observation, dict) or not text(observation.get('observation')):
+                    issue('REVIEW_EVIDENCE_MISSING', '证据必须记录具体观测。', f'{context}: {category}')
+                else:
+                    cited(observation, f'{context}: {category}')
+
     claims = review.get('claims', [])
     if not isinstance(claims, list):
         issue('REVIEW_CLAIMS_INVALID', 'claims 必须为数组。')
@@ -282,57 +449,30 @@ def review_issues(cfg, require_review=False):
                 issue('REVIEW_CLAIM_INCOMPLETE', '主张需要理由、反证和可证伪条件。', f'{cid}: {key}')
         if not iso_date(claim.get('review_date')):
             issue('REVIEW_CLAIM_INCOMPLETE', '主张需要 ISO 格式的下次复核日期。', str(cid))
-        benchmark = claim.get('benchmark')
-        if not isinstance(benchmark, dict):
-            issue('REVIEW_BENCHMARK_MISSING', '需披露保守参照及其适用限制。', str(cid))
-            benchmark = {}
-        cited(benchmark, f'{cid}: benchmark')
-        if not text(benchmark.get('description')) or not text(benchmark.get('limitations')):
-            issue('REVIEW_BENCHMARK_MISSING', '参照组需要描述及匹配限制。', str(cid))
-        if kind == 'growth_persistence':
-            for field in ('industry', 'scale', 'business_model', 'stage', 'order_visibility'):
-                if not text(benchmark.get(field)):
-                    issue('REVIEW_COHORT_INCOMPLETE', '增长参照需说明行业、规模、模式、阶段及订单可见度。', f'{cid}: {field}')
-        percentile = benchmark.get('percentile')
-        if percentile is not None:
-            distribution = benchmark.get('distribution')
-            if not number(percentile) or not 0 <= percentile <= 100 or not isinstance(distribution, dict):
-                issue('REVIEW_UNSUPPORTED_PERCENTILE', '具体分位必须有可追溯分布；无分布请用 null。', str(cid))
-            else:
-                size = distribution.get('sample_size')
-                if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or any(
-                    not text(distribution.get(k)) for k in ('dataset', 'period', 'metric')):
-                    issue('REVIEW_UNSUPPORTED_PERCENTILE', '分位缺少数据集、样本量、样本期间或指标口径。', str(cid))
-                cited(distribution, f'{cid}: distribution')
+        check_benchmark(claim.get('benchmark'), cid, requires_growth=kind == 'growth_persistence')
         status = claim.get('status')
         if status not in ('supported', 'unsupported', 'unknown'):
             issue('REVIEW_SUPPORT_STATUS', '主张状态必须为 supported、unsupported 或 unknown。', str(cid))
-        objective_recovery = parameter in ('/epv/normalized_earnings', '/eva/nopat') and number(annual) and number(assumed) and assumed > annual + 1e-6
+        objective_recovery = parameter in actual_uplifts or (
+            parameter in ('/epv/normalized_earnings', '/eva/nopat') and number(annual) and number(assumed) and assumed > annual + 1e-6)
+        if parameter in cash_claim_kinds and kind != cash_claim_kinds[parameter]:
+            issue('REVIEW_CLAIM_KIND', '收入需按增长主张、利润率需按恢复主张复核。', parameter)
         if parameter in ('/epv/normalized_earnings', '/eva/nopat'):
             if kind != 'earnings_recovery':
                 issue('REVIEW_CLAIM_KIND', '盈利水平必须按 earnings_recovery 复核。', parameter)
             if number(annual) and number(conservative) and conservative > annual + 1e-6:
                 issue('REVIEW_RECOVERY_BASELINE_INFLATED', '不得把高于当前实际盈利的恢复值重新命名为保守基线。', parameter)
         if status == 'supported':
-            evidence = claim.get('evidence', {})
-            if not isinstance(evidence, dict):
-                evidence = {}
-            for category in ('business', 'cash_flow', 'competition'):
-                observations = evidence.get(category)
-                if not isinstance(observations, list) or not observations:
-                    issue('REVIEW_EVIDENCE_MISSING', '支持有利假设需提供业务、现金流及竞争证据，强度标签不能替代。', f'{cid}: {category}')
-                    continue
-                for observation in observations:
-                    if not isinstance(observation, dict) or not text(observation.get('observation')):
-                        issue('REVIEW_EVIDENCE_MISSING', '证据必须记录具体观测。', f'{cid}: {category}')
-                    else:
-                        cited(observation, f'{cid}: {category}')
+            supported_evidence(claim, cid)
         elif (objective_recovery or uplift(assumed, conservative)) and (role == 'decision' or owner in valid_models):
             issue('REVIEW_UNSUPPORTED_DECISION_UPLIFT', '未获支持的有利假设不能进入决策基准或概率加权估值。', str(parameter))
 
     def require_claim(parameter):
         if parameter not in covered:
             issue('REVIEW_KEY_ASSUMPTION_MISSING', '决策使用的关键增长或盈利参数缺少证据复核。', parameter)
+
+    for parameter in required_cash_claims:
+        require_claim(parameter)
 
     for pointer in valid_models:
         block = resolve_pointer(cfg, pointer)
@@ -360,12 +500,52 @@ def review_issues(cfg, require_review=False):
             if number(block.get('nopat_growth')) and block['nopat_growth'] > 0:
                 require_claim('/eva/nopat_growth')
         elif pointer == '/montecarlo':
-            require_claim('/montecarlo/growth_mean')
-            require_claim('/montecarlo/margin_mode')
-            if number(block.get('terminal_g')) and block['terminal_g'] > 0:
-                require_claim('/montecarlo/terminal_g')
-    uses_top_g = any(p.startswith('/scenarios/') for p in valid_models) or (
-        '/montecarlo' in valid_models and 'terminal_g' not in cfg['montecarlo'])
+            record = review.get('montecarlo_distribution')
+            if not isinstance(record, dict):
+                issue('REVIEW_MC_DISTRIBUTION_MISSING', '蒙特卡洛决策模型需整体复核有效分布规格、期望和尾部；均值/众数单独记录不足。')
+                continue
+            try:
+                actual_spec = montecarlo_spec(block, cfg)
+                actual_summary = montecarlo_summary(actual_spec)
+                conservative_record = record.get('conservative_spec')
+                if not isinstance(conservative_record, dict):
+                    raise ValueError('conservative_spec must be an effective specification')
+                conservative_spec = montecarlo_spec(conservative_record, conservative_record)
+                conservative_summary = montecarlo_summary(conservative_spec)
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                issue('REVIEW_MC_DISTRIBUTION_INVALID', '分布复核规格无效或其统计量不可计算。', str(exc))
+                continue
+            for key, actual in (('assumed_spec', actual_spec), ('conservative_spec', conservative_spec),
+                                ('assumed_summary', actual_summary), ('conservative_summary', conservative_summary)):
+                if not same_record(actual, record.get(key)):
+                    issue('REVIEW_MC_DISTRIBUTION_MISMATCH', '分布复核需匹配完整有效规格及程序计算的期望/尾部，含继承默认值。', key)
+            if cash_valid and not same(actual_spec['base_revenue'], cash_baseline['revenue']):
+                issue('REVIEW_MC_BASELINE_MISMATCH', '蒙特卡洛 base_revenue 必须等于实际 FCFF 基线收入；预测收入不能冒充基期。')
+            for key in ('rationale', 'counterevidence', 'falsifier', 'expectation_rationale', 'tail_rationale'):
+                if not text(record.get(key)):
+                    issue('REVIEW_MC_DISTRIBUTION_INCOMPLETE', '分布复核需说明预期、尾部概率/幅度依据、反证及失效条件。', key)
+            if not iso_date(record.get('review_date')) or record.get('use') != 'decision':
+                issue('REVIEW_MC_DISTRIBUTION_INCOMPLETE', '分布复核需 ISO 复核日期和 use=decision。')
+            check_benchmark(record.get('benchmark'), 'montecarlo_distribution',
+                            requires_growth=actual_summary['growth_high'] > 0 or actual_spec['terminal_g'] > 0)
+            status = record.get('status')
+            if status not in ('supported', 'unsupported', 'unknown'):
+                issue('REVIEW_SUPPORT_STATUS', '分布复核状态必须为 supported、unsupported 或 unknown。')
+            favorable = any(actual_summary[k] > conservative_summary[k] + 1e-6 for k in actual_summary if not k.startswith('wacc_'))
+            favorable |= any(actual_summary[k] < conservative_summary[k] - 1e-6 for k in actual_summary if k.startswith('wacc_'))
+            favorable |= any(actual_spec[k] > conservative_spec[k] + 1e-6 for k in ('base_revenue', 'terminal_g'))
+            favorable |= any(actual_spec[k] < conservative_spec[k] - 1e-6 for k in ('annual_dilution', 'shares', 'net_debt'))
+            favorable |= any(actual_spec[k] != conservative_spec[k] for k in ('years', 'fade_years'))
+            # Even a renamed conservative distribution cannot erase recovery
+            # relative to actual FCFF, or positive growth in the upper tail.
+            favorable |= actual_summary['growth_high'] > 0 or actual_spec['terminal_g'] > 0
+            if cash_valid:
+                favorable |= actual_summary['margin_high'] > cash_baseline['fcff'] / cash_baseline['revenue'] + 1e-6
+            if status == 'supported':
+                supported_evidence(record, 'montecarlo_distribution')
+            elif favorable:
+                issue('REVIEW_UNSUPPORTED_DECISION_UPLIFT', '未支持的分布上行（含相对实际的恢复、期望或尾部改善）不能进入决策估值。', '/montecarlo')
+    uses_top_g = any(p.startswith('/scenarios/') for p in valid_models)
     if uses_top_g:
         if number(cfg.get('terminal_g')) and cfg['terminal_g'] > 0:
             require_claim('/terminal_g')
@@ -421,7 +601,6 @@ def review_issues(cfg, require_review=False):
             if not isinstance(block, dict) or not downside.get('model_path', '').startswith('/scenarios/'):
                 issue('REVIEW_DOWNSIDE_MISSING', '下行情景必须关联可复算的 scenarios 模型。')
             else:
-                from dcf import scenario_fcfs
                 try:
                     path, _ = scenario_fcfs(block, cfg.get('terminal_g', 0.0))
                 except (ValueError, OverflowError):

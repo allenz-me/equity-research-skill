@@ -1,0 +1,360 @@
+{
+  "price": 10,
+  "shares": 10,
+  "research_review": {
+    "version": 1,
+    "sources": [
+      {
+        "id": "demo",
+        "locator": "synthetic://illustrative-inputs-only-not-investment-evidence",
+        "date": "2026-07-31"
+      }
+    ],
+    "baseline": {
+      "earnings_basis": "NOPAT",
+      "currency": "USD",
+      "unit": "million",
+      "annual_period": "TTM ending 2026-06-30",
+      "annual_earnings": 10,
+      "source_ids": [
+        "demo"
+      ],
+      "periods": [
+        {
+          "period": "2026Q1",
+          "start": "2026-01-01",
+          "end": "2026-03-31",
+          "prior_start": "2025-01-01",
+          "prior_end": "2025-03-31",
+          "actual": true,
+          "comparable": true,
+          "profit": 2.5,
+          "prior_profit": 2.5,
+          "source_ids": [
+            "demo"
+          ]
+        },
+        {
+          "period": "2026Q2",
+          "start": "2026-04-01",
+          "end": "2026-06-30",
+          "prior_start": "2025-04-01",
+          "prior_end": "2025-06-30",
+          "actual": true,
+          "comparable": true,
+          "profit": 2.5,
+          "prior_profit": 2.5,
+          "source_ids": [
+            "demo"
+          ]
+        }
+      ],
+      "cash_flow": {
+        "actual": true,
+        "revenue": 100,
+        "nopat": 10,
+        "da": 5,
+        "capex": 5,
+        "change_nwc": 0,
+        "fcff": 10,
+        "source_ids": [
+          "demo"
+        ]
+      }
+    },
+    "claims": [
+      {
+        "id": "revenue-growth",
+        "kind": "growth_persistence",
+        "parameter": "/scenarios/0/revenue",
+        "conservative_value": [
+          100,
+          100,
+          100
+        ],
+        "assumed_value": [
+          100,
+          120,
+          132
+        ],
+        "status": "supported",
+        "use": "decision",
+        "rationale": "Synthetic illustration: operating observations below support this path; no real company is represented.",
+        "counterevidence": "Synthetic illustration: weaker renewals or higher investment would reduce the assumed cash conversion.",
+        "review_date": "2026-10-31",
+        "falsifier": "Review if observed revenue, renewals, investment or cash collection fail to support the path.",
+        "benchmark": {
+          "description": "Synthetic actual annual revenue 100, NOPAT 10 and FCFF 10 before any forecast growth or recovery.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": [
+            "demo"
+          ],
+          "industry": "software",
+          "scale": "small revenue cohort",
+          "business_model": "subscription",
+          "stage": "scaling",
+          "order_visibility": "contract backlog and cash receipts"
+        },
+        "evidence": {
+          "business": [
+            {
+              "observation": "Synthetic contracted renewals support the stated revenue path and repricing.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ],
+          "cash_flow": [
+            {
+              "observation": "Synthetic collection and investment records support the stated FCFF path after all capital expenditure.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ],
+          "competition": [
+            {
+              "observation": "Synthetic renewal observations show stable customer share after the assumed repricing.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": "fcff-recovery",
+        "kind": "earnings_recovery",
+        "parameter": "/scenarios/0/fcf_margin",
+        "conservative_value": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "assumed_value": [
+          0.12,
+          0.13,
+          0.14
+        ],
+        "status": "supported",
+        "use": "decision",
+        "rationale": "Synthetic illustration: operating observations below support this path; no real company is represented.",
+        "counterevidence": "Synthetic illustration: weaker renewals or higher investment would reduce the assumed cash conversion.",
+        "review_date": "2026-10-31",
+        "falsifier": "Review if observed revenue, renewals, investment or cash collection fail to support the path.",
+        "benchmark": {
+          "description": "Synthetic actual annual revenue 100, NOPAT 10 and FCFF 10 before any forecast growth or recovery.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": [
+            "demo"
+          ],
+          "industry": "software",
+          "scale": "small revenue cohort",
+          "business_model": "subscription",
+          "stage": "scaling",
+          "order_visibility": "contract backlog and cash receipts"
+        },
+        "evidence": {
+          "business": [
+            {
+              "observation": "Synthetic contracted renewals support the stated revenue path and repricing.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ],
+          "cash_flow": [
+            {
+              "observation": "Synthetic collection and investment records support the stated FCFF path after all capital expenditure.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ],
+          "competition": [
+            {
+              "observation": "Synthetic renewal observations show stable customer share after the assumed repricing.",
+              "source_ids": [
+                "demo"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": "weak-fcff",
+        "kind": "earnings_recovery",
+        "parameter": "/scenarios/1/fcf",
+        "conservative_value": [
+          10,
+          8,
+          6
+        ],
+        "assumed_value": [
+          10,
+          8,
+          6
+        ],
+        "status": "unknown",
+        "use": "decision",
+        "rationale": "Synthetic illustration: operating observations below support this path; no real company is represented.",
+        "counterevidence": "Synthetic illustration: weaker renewals or higher investment would reduce the assumed cash conversion.",
+        "review_date": "2026-10-31",
+        "falsifier": "Review if observed revenue, renewals, investment or cash collection fail to support the path.",
+        "benchmark": {
+          "description": "Synthetic actual annual revenue 100, NOPAT 10 and FCFF 10 before any forecast growth or recovery.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": [
+            "demo"
+          ],
+          "industry": "software",
+          "scale": "small revenue cohort",
+          "business_model": "subscription",
+          "stage": "scaling",
+          "order_visibility": "contract backlog and cash receipts"
+        },
+        "evidence": {}
+      },
+      {
+        "id": "weak-revenue",
+        "kind": "growth_persistence",
+        "parameter": "/scenarios/1/operating_bridge/revenue",
+        "conservative_value": [
+          100,
+          100,
+          100
+        ],
+        "assumed_value": [
+          100,
+          100,
+          100
+        ],
+        "status": "unknown",
+        "use": "decision",
+        "rationale": "Synthetic illustration: operating observations below support this path; no real company is represented.",
+        "counterevidence": "Synthetic illustration: weaker renewals or higher investment would reduce the assumed cash conversion.",
+        "review_date": "2026-10-31",
+        "falsifier": "Review if observed revenue, renewals, investment or cash collection fail to support the path.",
+        "benchmark": {
+          "description": "Synthetic actual annual revenue 100, NOPAT 10 and FCFF 10 before any forecast growth or recovery.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": [
+            "demo"
+          ],
+          "industry": "software",
+          "scale": "small revenue cohort",
+          "business_model": "subscription",
+          "stage": "scaling",
+          "order_visibility": "contract backlog and cash receipts"
+        },
+        "evidence": {}
+      },
+      {
+        "id": "weak-nopat",
+        "kind": "earnings_recovery",
+        "parameter": "/scenarios/1/operating_bridge/nopat_margin",
+        "conservative_value": [
+          0.1,
+          0.08,
+          0.06
+        ],
+        "assumed_value": [
+          0.1,
+          0.08,
+          0.06
+        ],
+        "status": "unknown",
+        "use": "decision",
+        "rationale": "Synthetic illustration: operating observations below support this path; no real company is represented.",
+        "counterevidence": "Synthetic illustration: weaker renewals or higher investment would reduce the assumed cash conversion.",
+        "review_date": "2026-10-31",
+        "falsifier": "Review if observed revenue, renewals, investment or cash collection fail to support the path.",
+        "benchmark": {
+          "description": "Synthetic actual annual revenue 100, NOPAT 10 and FCFF 10 before any forecast growth or recovery.",
+          "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+          "percentile": null,
+          "source_ids": [
+            "demo"
+          ],
+          "industry": "software",
+          "scale": "small revenue cohort",
+          "business_model": "subscription",
+          "stage": "scaling",
+          "order_visibility": "contract backlog and cash receipts"
+        },
+        "evidence": {}
+      }
+    ],
+    "decision": {
+      "action": "wait",
+      "model_paths": [
+        "/scenarios/0",
+        "/scenarios/1"
+      ]
+    }
+  },
+  "wacc": 0.1,
+  "terminal_g": 0.0,
+  "scenarios": [
+    {
+      "name": "supported-growth-and-recovery",
+      "prob": 0.65,
+      "probability_rationale": "Synthetic prior weight revised for observed renewals; no automatic evidence-strength mapping.",
+      "revenue": [
+        100,
+        120,
+        132
+      ],
+      "fcf_margin": [
+        0.12,
+        0.13,
+        0.14
+      ]
+    },
+    {
+      "name": "weak-cash-conversion",
+      "prob": 0.35,
+      "probability_rationale": "Synthetic remaining weight for adverse margin observations.",
+      "fcf": [
+        10,
+        8,
+        6
+      ],
+      "operating_bridge": {
+        "revenue": [
+          100,
+          100,
+          100
+        ],
+        "nopat_margin": [
+          0.1,
+          0.08,
+          0.06
+        ],
+        "da": [
+          5,
+          5,
+          5
+        ],
+        "capex": [
+          5,
+          5,
+          5
+        ],
+        "change_nwc": [
+          0,
+          0,
+          0
+        ],
+        "source_ids": [
+          "demo"
+        ]
+      }
+    }
+  ],
+  "net_debt": 0
+}

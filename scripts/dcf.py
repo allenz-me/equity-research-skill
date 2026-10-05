@@ -259,6 +259,35 @@ def moat_verdict(ratio):
     if ratio <= 1.3: return 'EPV≈净资产 → 无/弱护城河的辛苦生意'
     return 'EPV≫净资产 → 护城河的财务度量（差额=特许经营价值）'
 
+def epv_asset_history(c):
+    """Validate and calculate historical equity EPV with each period's financing bridge."""
+    object_input(c, 'epv')
+    if 'asset_series' not in c: return []
+    if not isinstance(c['asset_series'], list): die('epv.asset_series 必须是数组')
+    basis = earnings_basis(c.get('earnings_basis', 'NOPAT'))
+    coc = number(need(c, 'coc', 'epv'), 'epv.coc', positive=True)
+    history = []
+    for i, row in enumerate(c['asset_series']):
+        ctx = f'epv.asset_series[{i}]'
+        if not isinstance(row, dict):
+            die(f'{ctx} 须为含 period、normalized_earnings、asset_value 的对象；NOPAT 还须逐期提供 net_debt')
+        yr = need(row, 'period', ctx)
+        if not isinstance(yr, str) or not yr.strip(): die(f'{ctx}.period 必须是非空字符串')
+        if earnings_basis(row.get('earnings_basis', basis)) != basis:
+            die(f'{ctx}.earnings_basis 必须与当前 EPV 口径一致')
+        if basis == 'NOPAT': firm_basis(row, ctx)
+        else: equity_basis(row, ctx)
+        ee = number(need(row, 'normalized_earnings', ctx), f'{ctx}.normalized_earnings')
+        aa = number(need(row, 'asset_value', ctx), f'{ctx}.asset_value', positive=True)
+        cc = number(row.get('coc', coc), f'{ctx}.coc', positive=True)
+        # Historical financing must be supplied; today's debt is not a historical proxy.
+        dd = need(row, 'net_debt', ctx) if basis == 'NOPAT' else row.get('net_debt', 0.0)
+        period_epv = epv_value(ee, cc, basis, dd, row.get('excess_cash', 0.0))
+        history.append({'period': yr, 'normalized_earnings': ee, 'asset_value': aa,
+                        'coc': cc, 'net_debt': dd, 'earnings_basis': basis,
+                        **period_epv, 'ratio': number(period_epv['equity'] / aa, f'{ctx}.ratio')})
+    return history
+
 def run_epv(c):
     object_input(c, 'epv')
     role, role_label = model_role(c, 'epv')
@@ -274,22 +303,19 @@ def run_epv(c):
     ep = epv_value(e, coc, basis, nd, xc)
     rate_name = 'WACC' if basis == 'NOPAT' else 'CoE'
     print(f"\n=== 盈利能力价值 EPV === {role_label} | 口径 {basis} | 常态化盈利 {e} | {rate_name} {coc:.2%}")
-    epv_ps = ep['equity'] / sh
+    epv_ps = number(ep['equity'] / sh, 'epv.per_share')
     print(f"  EPV 权益价值 {ep['equity']:,.1f} | 每股 {epv_ps:,.2f}")
     print_equity_shortfall(ep, 'EPV')
+    ratio = None
     if av:
-        ratio = ep['equity'] / av
+        ratio = number(ep['equity'] / av, 'epv.asset_ratio')
         print(f"  护城河验证：EPV/净资产 = {ratio:.2f}x → {moat_verdict(ratio)}")
-    if c.get('asset_series'):
-        if not isinstance(c['asset_series'], list): die('epv.asset_series 必须是数组')
-        print("  EPV/净资产 多年趋势：")
-        for row in c['asset_series']:
-            if not isinstance(row, list) or len(row) != 3:
-                die("epv.asset_series 每行须为 [期间, 盈利, 资产价值]")
-            yr, ee, aa = row
-            ee = number(ee, 'epv.asset_series.earnings')
-            aa = number(aa, 'epv.asset_series.asset_value', positive=True)
-            print(f"    {yr}: {(ee/coc)/aa:.2f}x")
+    asset_series = epv_asset_history(c)
+    if asset_series:
+        print(f"  EPV/净资产 多年趋势（{basis}；逐期权益桥；未填 coc 的期间沿用 {rate_name} {coc:.2%}）：")
+        for row in asset_series:
+            print(f"    {row['period']}: {row['ratio']:.2f}x | {rate_name} {row['coc']:.2%}")
+            print_equity_shortfall(row, row['period'])
     growth_ps, fg = None, None
     g = c.get('growth')
     if g is not None:
@@ -301,16 +327,17 @@ def run_epv(c):
         if fg is None:
             print("  成长价值：不可计算（需 franchise 模式、有效 ROIIC、g<coc、再投资率 g/ROIIC∈[0,1]）；保留零增长 EPV，不自动加价")
         else:
-            growth_ps = fg['equity'] / sh
+            growth_ps = number(fg['equity'] / sh, 'epv.growth.per_share')
             warn = ' ⚠ ROIIC<coc，增长毁灭价值' if roiic < coc else ''
             print(f"  成长价值（franchise 严格式，g={gg:.1%}，ROIIC={roiic:.1%}）：每股 {growth_ps:,.2f}{warn}")
             print_equity_shortfall(fg, '成长价值')
     if av and price:
-        asset_ps = av / sh
+        asset_ps = number(av / sh, 'epv.asset_per_share')
         ladder_label = '买点阶梯' if role == 'decision' else '条件估值参考'
         print(f"  {ladder_label}：底价 {asset_ps:,.2f}｜EPV {epv_ps:,.2f}" +
               (f"｜成长调整 {growth_ps:,.2f}" if growth_ps is not None else ""))
-    return {"epv_ps": epv_ps, "growth_ps": growth_ps, **ep, "growth": fg, "role": role}
+    return {"epv_ps": epv_ps, "growth_ps": growth_ps, **ep, "growth": fg, "role": role,
+            "asset_ratio": ratio, "asset_series": asset_series}
 
 # ---------- EVA / 剩余收益 ----------
 
@@ -402,14 +429,10 @@ def run_pvgo(c, top):
 
 # ---------- 蒙特卡洛 ----------
 
-def run_montecarlo(c, top):
+def montecarlo_spec(c, top):
+    """Validated effective economic inputs shared by simulation and evidence review."""
     firm_basis(c, 'montecarlo')
-    role, role_label = model_role(c, 'montecarlo')
-    n = year_count(c.get('n', 2000), 'montecarlo.n', minimum=1)
-    seed = c.get('seed', 42)
-    if isinstance(seed, bool) or not isinstance(seed, (int, str)):
-        die('montecarlo.seed 必须是整数或字符串')
-    rng = random.Random(seed)
+    object_input(top, 'montecarlo 顶层')
     years = year_count(c.get('years', 5), 'montecarlo.years', minimum=1)
     rev0 = number(need(c, 'base_revenue', 'montecarlo'), 'montecarlo.base_revenue', positive=True)
     gm = growth_rate(need(c, 'growth_mean', 'montecarlo'), 'montecarlo.growth_mean')
@@ -429,11 +452,34 @@ def run_montecarlo(c, top):
     dilution = growth_rate(c.get('annual_dilution', 0.0), 'montecarlo.annual_dilution')
     shares = number(top.get('shares'), 'montecarlo.shares', positive=True)
     nd = debt_bridge(top.get('net_debt', 0.0), c.get('excess_cash', 0), 'montecarlo')
+    return {'base_revenue': rev0, 'growth_mean': gm, 'growth_std': gs,
+            'margin_low': ml, 'margin_mode': mm, 'margin_high': mh,
+            'wacc_low': wl, 'wacc_high': wh, 'terminal_g': g,
+            'years': years, 'fade_years': fade, 'annual_dilution': dilution,
+            'shares': shares, 'net_debt': nd,
+            'growth_distribution': 'clipped_normal_3sigma',
+            'margin_distribution': 'triangular', 'wacc_distribution': 'uniform',
+            'sampling': 'independent_constant_growth_and_margin'}
+
+
+def run_montecarlo(c, top):
+    spec = montecarlo_spec(c, top)
+    role, role_label = model_role(c, 'montecarlo')
+    n = year_count(c.get('n', 2000), 'montecarlo.n', minimum=1)
+    seed = c.get('seed', 42)
+    if isinstance(seed, bool) or not isinstance(seed, (int, str)):
+        die('montecarlo.seed 必须是整数或字符串')
+    rng = random.Random(seed)
+    rev0, gm, gs = (spec[k] for k in ('base_revenue', 'growth_mean', 'growth_std'))
+    ml, mm, mh = (spec[k] for k in ('margin_low', 'margin_mode', 'margin_high'))
+    wl, wh, g = (spec[k] for k in ('wacc_low', 'wacc_high', 'terminal_g'))
+    years, fade, dilution = (spec[k] for k in ('years', 'fade_years', 'annual_dilution'))
+    shares, nd = spec['shares'], spec['net_debt']
     price = top.get('price')
     if price is not None: price = number(price, 'montecarlo.price', positive=True)
     vals, raw_vals, raw_equities, shortfalls = [], [], [], []
     for _ in range(n):
-        gr = max(min(rng.gauss(gm, gs), gm + 3 * gs), gm - 3 * gs)   # 截断正态
+        gr = max(min(rng.gauss(gm, gs), gm + 3 * gs), gm - 3 * gs)   # 正态尾部裁剪至 ±3σ，不是重抽样截断
         mg = rng.triangular(ml, mh, mm)
         wc = rng.uniform(wl, wh)
         rev, fcfs = rev0, []
@@ -460,9 +506,10 @@ def run_montecarlo(c, top):
         print(f"  {out['equity_shortfall_count']}/{n} 次模拟原始权益为负并归零；最低原始权益 {out['min_raw_equity']:,.2f}，"
               f"全样本平均权益缺口 {out['mean_equity_shortfall']:,.2f}；{EQUITY_FLOOR_NOTE}")
     if price:
-        p_loss = sum(1 for v in vals if v < price) / n
-        out["p_loss"] = p_loss
-        print(f"  P(内在价值 < 现价 {price}) = {p_loss:.0%}  ← “现价买入是错误”的模型概率")
+        probability = sum(1 for v in vals if v < price) / n
+        out["p_value_below_price"] = probability
+        out["p_loss"] = probability  # Deprecated compatibility alias; not a realized-loss probability.
+        print(f"  P(模型内在价值 < 现价 {price}) = {probability:.0%}（给定输入分布；不代表持有期亏损概率）")
     return out
 
 # ---------- 仓位思维 ----------
@@ -485,6 +532,7 @@ def run_position(results, cfg):
     if not pairs: return
     if any(not math.isfinite(p) or not 0 <= p <= 1 for p, _ in pairs) or not math.isclose(sum(p for p, _ in pairs), 1, abs_tol=1e-6):
         die('仓位: 决策情景概率必须在 [0,1] 且合计为 1')
+    pairs = [(p, v) for p, v in pairs if p > 0]
     ev_ret = sum(p * (v / price - 1) for p, v in pairs)
     ups = [(p, v / price - 1) for p, v in pairs if v > price]
     downs = [(p, 1 - v / price) for p, v in pairs if v <= price]
@@ -598,7 +646,11 @@ def run(cfg):
     if cfg.get("epv") is not None:         run_epv(cfg["epv"])
     if cfg.get("eva") is not None:         run_eva(cfg["eva"], cfg)
     if cfg.get("montecarlo") is not None:  run_montecarlo(cfg["montecarlo"], cfg)
-    run_position(results, cfg)
+    review = cfg.get('research_review')
+    decision = review.get('decision') if isinstance(review, dict) else None
+    # A valuation-only request still computes values, but does not request position sizing.
+    if not (isinstance(decision, dict) and decision.get('action') == 'none'):
+        run_position(results, cfg)
 
     if 'range_low' in cfg or 'range_high' in cfg:
         lo, hi = need(cfg, 'range_low', '标定'), need(cfg, 'range_high', '标定')
@@ -626,7 +678,10 @@ DEMO = {
     "epv": {"earnings_basis": "NOPAT", "normalized_earnings": 6.0, "coc": 0.09,
             "net_debt": 5.0, "shares": 1.0, "asset_value": 30.0, "price": 100.0,
             "growth": {"g": 0.04, "roiic": 0.20, "mode": "franchise"},
-            "asset_series": [["FY-2", 4.5, 26], ["FY-1", 5.2, 28], ["最新", 6.0, 30]]},
+            "asset_series": [
+                {"period": "FY-2", "normalized_earnings": 4.5, "asset_value": 26, "net_debt": 4.0},
+                {"period": "FY-1", "normalized_earnings": 5.2, "asset_value": 28, "net_debt": 4.5},
+                {"period": "最新", "normalized_earnings": 6.0, "asset_value": 30, "net_debt": 5.0}]},
     "eva": {"invested_capital": 40.0, "nopat": 6.0, "fade_years": 10,
             "reinvestment_rate": 0.4, "roiic": 0.20},
     "montecarlo": {"n": 2000, "base_revenue": 10, "years": 5,

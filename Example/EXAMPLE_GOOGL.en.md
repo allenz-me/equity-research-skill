@@ -295,7 +295,7 @@ Recent events:
 
 ### 9.3 Position sizing
 
-Probability-weighted expected return **EV = -29%**. Bull upside is about 0%, while Bear downside is -53%, so the **asymmetry ratio is about 0**, far below the 1.5 threshold for initiating a position. Monte Carlo **P(loss) = 94%**. Kelly-lite = 0. This payoff structure supports **zero new-position size**. Existing holders are different: if cost basis is far below the current price, the value of holding depends on tax, alternatives, and opportunity cost, so the same matrix does not apply.
+Probability-weighted expected return **EV = -29%**. Bull upside is about 0%, while Bear downside is -53%, so the **asymmetry ratio is about 0**, far below the 1.5 threshold for initiating a position. Under the assumed input distributions, Monte Carlo **P(model intrinsic value < current price) = 94%**; this is not a realized-loss probability. Kelly-lite = 0. This payoff structure supports **zero new-position size**. Existing holders are different: if cost basis is far below the current price, the value of holding depends on tax, alternatives, and opportunity cost, so the same matrix does not apply.
 
 ### 9.4 Monitoring checklist
 

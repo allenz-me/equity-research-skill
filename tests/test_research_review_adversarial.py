@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from research_review import review_issues
+from test_research_review import growth_example, direct_fcf_example, mc_example
 
 
 class ResearchReviewAdversarialTests(unittest.TestCase):
@@ -69,6 +70,50 @@ class ResearchReviewAdversarialTests(unittest.TestCase):
         claim.update(parameter="/epv/shares", assumed_value=10, conservative_value=10)
         issues = self.assert_blocked(self.cfg)
         self.assertTrue(any(issue["code"] == "REVIEW_KEY_ASSUMPTION_MISSING" for issue in issues))
+
+    def test_cash_baseline_and_operating_bridge_reject_malformed_fields(self):
+        for value in (None, [], True, float('inf'), float('nan')):
+            with self.subTest(value=value):
+                cfg = growth_example()
+                cfg['research_review']['baseline']['cash_flow']['fcff'] = value
+                self.assert_blocked(cfg)
+                cfg = direct_fcf_example()
+                cfg['scenarios'][0]['operating_bridge']['da'] = value
+                self.assert_blocked(cfg)
+        cfg = direct_fcf_example()
+        cfg['scenarios'][0]['operating_bridge']['capex'].pop()
+        self.assert_blocked(cfg)
+        cfg = growth_example()
+        cfg['research_review']['baseline']['cash_flow'].update(revenue=1e-300, nopat=1e300, fcff=1e300)
+        cfg['research_review']['baseline']['annual_earnings'] = 1e300
+        self.assert_blocked(cfg)
+        cfg = direct_fcf_example()
+        cfg['scenarios'][0]['fcf'][0] = 1e300
+        cfg['scenarios'][0]['operating_bridge']['revenue'][0] = 5e-324
+        cfg['scenarios'][0]['operating_bridge']['da'][0] = 1e300
+        issues = self.assert_blocked(cfg)
+        self.assertTrue(any(i['code'] == 'REVIEW_FCFF_BRIDGE_INVALID' for i in issues))
+
+    def test_distribution_records_reject_incomplete_or_false_snapshots(self):
+        for field, value in [('assumed_spec', {}), ('assumed_summary', None),
+                             ('conservative_spec', []), ('conservative_summary', {}),
+                             ('benchmark', []), ('evidence', []), ('use', 'conditional')]:
+            with self.subTest(field=field):
+                cfg = mc_example()
+                cfg['research_review']['montecarlo_distribution'][field] = value
+                self.assert_blocked(cfg)
+        for value in (None, [], True):
+            cfg = mc_example()
+            cfg['research_review']['montecarlo_distribution'] = value
+            self.assert_blocked(cfg)
+
+    def test_distribution_family_and_upper_tail_cannot_be_silently_rewritten(self):
+        cfg = mc_example()
+        cfg['research_review']['montecarlo_distribution']['assumed_spec']['growth_distribution'] = 'truncated_normal'
+        self.assert_blocked(cfg)
+        cfg = mc_example()
+        cfg['research_review']['montecarlo_distribution']['assumed_summary']['margin_p90'] = float('nan')
+        self.assert_blocked(cfg)
 
 
 if __name__ == "__main__":

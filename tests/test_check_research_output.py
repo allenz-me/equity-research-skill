@@ -184,6 +184,111 @@ class FinancialPeriodTests(unittest.TestCase):
         self.assertIn("average_total_assets=200.0", issue.detail)
 
 
+class FinancialNumberTests(unittest.TestCase):
+    @staticmethod
+    def check_csv(data):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "financials.csv")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            issues = []
+            CHECKER.check_financials(path, issues)
+            return issues
+
+    def test_complete_financial_formats_preserve_signs_and_scales(self):
+        for raw, expected in (("(100)", -100), ("（1,200.5）", -1200.5), ("(12%)", -.12),
+                              ("1.2亿元", 120000000), ("1.2万股", 12000), ("1.2b", 1200000000),
+                              ("$-1,200.5", -1200.5), ("-$1,200.5", -1200.5),
+                              ("1.2e-5", .000012), ("2x", 2)):
+            with self.subTest(raw=raw):
+                self.assertAlmostEqual(expected, CHECKER.parse_number(raw))
+
+    def test_invalid_formats_and_nonfinite_values_are_errors_not_missing(self):
+        for raw in ("abc100xyz", "1.2亿abc", "1,00", "(100", "-(100)", "(+100)",
+                    "1e309", "1e308亿", "NaN", "Infinity", "$10%", "1_000", "1.2万元人民币",
+                    float("inf"), float("-inf"), float("nan"), True, 10 ** 400):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    CHECKER.parse_number(raw)
+        for raw in (None, "", "—", "N/A", "未获取到", "not obtained"):
+            self.assertIsNone(CHECKER.parse_number(raw))
+
+    def test_accounting_loss_is_checked_as_negative(self):
+        data = "period,revenue,net_income,net_margin\n2025,1000,(100),-10%\n"
+        self.assertEqual([], self.check_csv(data))
+        issues = self.check_csv(data.replace(",-10%", ",10%"))
+        self.assertEqual(["NET_MARGIN_MISMATCH"], [issue.code for issue in issues])
+
+    def test_mixed_explicit_scales_are_converted_before_ratios(self):
+        data = "period,revenue,gross_profit,gross_margin\n2025,1.2亿,6000万,50%\n"
+        self.assertEqual([], self.check_csv(data))
+        issues = self.check_csv(data.replace("6000万", "0.6万"))
+        self.assertEqual(["GROSS_MARGIN_MISMATCH"], [issue.code for issue in issues])
+
+    def test_invalid_cell_reports_location_and_raw_value_without_parsing_notes(self):
+        issues = self.check_csv("period,revenue,notes\n2025,1e309,1e309 is an example\n")
+        self.assertEqual(["FINANCIALS_INVALID_NUMBER"], [issue.code for issue in issues])
+        self.assertEqual("P1", issues[0].severity)
+        for detail in ("row=2", "column='revenue'", "raw='1e309'"):
+            self.assertIn(detail, issues[0].detail)
+
+    def test_units_cannot_cross_amount_share_and_ratio_columns(self):
+        for col, raw in (("revenue", "10股"), ("net_income", "10%"), ("shares", "10万元"),
+                         ("shares", "$10"), ("gross_margin", "1亿")):
+            with self.subTest(col=col, raw=raw):
+                issues = self.check_csv(f"period,revenue,{col}\n2025,100,{raw}\n" if col != "revenue"
+                                        else f"period,revenue\n2025,{raw}\n")
+                self.assertEqual(["FINANCIALS_INVALID_NUMBER"], [issue.code for issue in issues])
+
+    def test_finite_inputs_with_nonfinite_calculations_are_reported(self):
+        cases = (
+            "period,revenue,gross_profit,gross_margin\n2025,1e-308,1e308,42%\n",
+            "period,revenue,revenue_yoy\n2024,1e-308,\n2025,1e308,1%\n",
+            "period,revenue,cfo,capex,fcf\n2025,100,-1e308,1e308,0\n",
+            "period,revenue,net_income,shares,eps\n2025,100,1e308,1e-308,0\n",
+            "period,revenue,cash_begin,cash_end,cfo,cfi,cff\n2025,100,1e308,0,1e308,0,0\n",
+            "period,revenue,net_income,cfo,average_total_assets,total_assets\n2025,100,1e308,-1e308,100,100\n",
+        )
+        for data in cases:
+            with self.subTest(data=data):
+                issues = self.check_csv(data)
+                issue = next(issue for issue in issues if issue.code == "FINANCIALS_NONFINITE_RESULT")
+                self.assertEqual("P1", issue.severity)
+                self.assertIn("row=", issue.detail)
+                self.assertIn("raw=", issue.detail)
+
+    @staticmethod
+    def mscore_data(prior_ca="50", current_ca="10", current_revenue="100", current_ppe="50"):
+        return ("period,revenue,receivables,gross_profit,ppe,current_assets,depreciation,sga,total_liabilities,total_assets,net_income,cfo,data_type\n"
+                f"2024,100,20,50,50,{prior_ca},10,10,40,100,10,10,actual\n"
+                f"2025,{current_revenue},20,50,{current_ppe},{current_ca},10,10,40,100,10,10,actual\n")
+
+    def test_zero_aqi_denominator_is_uncomputable_for_zero_and_positive_numerators(self):
+        for ca in ("10", "50"):
+            with self.subTest(current_ca=ca):
+                issues = self.check_csv(self.mscore_data(current_ca=ca))
+                score_issues = [issue for issue in issues if issue.code.startswith("FORENSIC_MSCORE")]
+                self.assertEqual(["FORENSIC_MSCORE_SKIPPED"], [issue.code for issue in score_issues])
+                self.assertEqual("P2", score_issues[0].severity)
+                self.assertIn("AQI", score_issues[0].detail)
+                self.assertIn("分母为零", score_issues[0].detail)
+
+    def test_small_nonzero_aqi_denominator_is_not_replaced_with_neutral_value(self):
+        issues = self.check_csv(self.mscore_data(prior_ca="49.9999"))
+        self.assertIn("FORENSIC_MSCORE_FLAG", [issue.code for issue in issues])
+        self.assertNotIn("FORENSIC_MSCORE_INFO", [issue.code for issue in issues])
+
+    def test_nonfinite_input_and_mscore_intermediate_never_get_normal_score(self):
+        cases = (self.mscore_data(prior_ca="20", current_revenue="1e309"),
+                 self.mscore_data(prior_ca="20", current_ca="1e308", current_ppe="1e308"))
+        for data, error in zip(cases, ("FINANCIALS_INVALID_NUMBER", "FINANCIALS_NONFINITE_RESULT")):
+            with self.subTest(error=error):
+                codes = [issue.code for issue in self.check_csv(data)]
+                self.assertIn(error, codes)
+                self.assertNotIn("FORENSIC_MSCORE_INFO", codes)
+                self.assertNotIn("FORENSIC_MSCORE_FLAG", codes)
+
+
 class BusinessRiskTests(unittest.TestCase):
     DATA = "period,revenue,net_income,cfo,total_assets,average_total_assets\n2025,500,100,10,500,500\n"
 
@@ -223,6 +328,19 @@ class BusinessRiskTests(unittest.TestCase):
             code, issues = self.run_check(data, strict=strict)
             self.assertEqual(1, code)
             self.assertIn("GROSS_MARGIN_MISMATCH", [issue["code"] for issue in issues])
+
+    def test_nonfinite_financial_inputs_fail_default_and_strict_runs(self):
+        data = "period,revenue,gross_profit,gross_margin\n2025,1e309,1e309,42%\n"
+        for strict in (False, True):
+            code, issues = self.run_check(data, strict=strict)
+            self.assertEqual(1, code)
+            self.assertEqual(["FINANCIALS_INVALID_NUMBER"] * 2, [issue["code"] for issue in issues])
+
+    def test_zero_aqi_is_explicitly_uncomputable_and_blocks_strict_run(self):
+        for strict, expected in ((False, 0), (True, 1)):
+            code, issues = self.run_check(FinancialNumberTests.mscore_data(), strict=strict)
+            self.assertEqual(expected, code)
+            self.assertEqual(["FORENSIC_MSCORE_SKIPPED"], [issue["code"] for issue in issues])
 
     def test_financial_industries_are_exempt_but_mixed_groups_are_not(self):
         for industries in (["banks"], ["insurance"], ["banks", "insurance"]):
@@ -266,7 +384,7 @@ class ValuationAssumptionTests(unittest.TestCase):
         self.assertEqual([], issues)
 
     def test_model_numeric_inputs_reject_strings_booleans_and_nonfinite_values(self):
-        for invalid in ("9%", "0.09", "1,000", True, False, float("nan"), float("inf"), float("-inf")):
+        for invalid in ("9%", "0.09", "1,000", True, False, float("nan"), float("inf"), float("-inf"), 10 ** 400):
             with self.subTest(invalid=invalid):
                 cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": invalid, "shares": 10}}
                 issues = self.check_config(cfg)
@@ -322,6 +440,33 @@ class ValuationAssumptionTests(unittest.TestCase):
     def test_net_income_epv_cannot_deduct_debt_twice(self):
         cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 60, "coc": 0.12, "shares": 10, "net_debt": 20}}
         self.assertTrue(any(issue.code == "EPV_EQUITY_DEBT_DOUBLE_COUNT" for issue in self.check_config(cfg)))
+
+    def test_epv_history_requires_each_periods_debt_for_nopat(self):
+        cfg = {"epv": {"normalized_earnings": 10, "coc": .1, "shares": 10,
+                       "net_debt": 50, "asset_value": 50,
+                       "asset_series": [{"period": "2025", "normalized_earnings": 10, "asset_value": 50}]}}
+        issues = self.check_config(cfg)
+        self.assertEqual(["EPV_ASSET_HISTORY_INVALID"], [issue.code for issue in issues])
+        self.assertIn("net_debt", issues[0].detail)
+        cfg["epv"]["asset_series"][0]["net_debt"] = 50
+        self.assertEqual([], self.check_config(cfg))
+
+    def test_equity_epv_history_accepts_ni_without_debt_and_rejects_second_deduction(self):
+        cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 10, "coc": .1, "shares": 10,
+                       "asset_series": [{"period": "2025", "normalized_earnings": 10, "asset_value": 50}]}}
+        self.assertEqual([], self.check_config(cfg))
+        cfg["epv"]["asset_series"][0]["net_debt"] = 50
+        self.assertEqual(["EPV_ASSET_HISTORY_INVALID"], [issue.code for issue in self.check_config(cfg)])
+
+    def test_oversized_debt_does_not_crash_equity_basis_check(self):
+        cfg = {"epv": {"earnings_basis": "NI", "normalized_earnings": 10, "coc": .1, "shares": 10, "net_debt": 10 ** 400}}
+        issues = self.check_config(cfg)
+        self.assertTrue(any(issue.code == "ASSUMPTION_INVALID_NUMBER" for issue in issues))
+
+    def test_bad_valuation_label_number_is_reported_without_crash(self):
+        issues = []
+        CHECKER.check_valuation_labels("合理", {"price": "1e309", "range_low": 1, "range_high": 2}, "report.md", issues)
+        self.assertEqual(["REPORT_INVALID_VALUATION_NUMBER"], [issue.code for issue in issues])
 
     def test_conditional_probability_is_optional_and_excluded(self):
         for probability in (None, 0.9):

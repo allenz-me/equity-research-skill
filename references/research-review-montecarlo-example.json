@@ -1,0 +1,211 @@
+{
+  "price": 10,
+  "shares": 10,
+  "research_review": {
+    "version": 1,
+    "sources": [
+      {
+        "id": "demo",
+        "locator": "synthetic://illustrative-inputs-only-not-investment-evidence",
+        "date": "2026-07-31"
+      }
+    ],
+    "baseline": {
+      "earnings_basis": "NOPAT",
+      "currency": "USD",
+      "unit": "million",
+      "annual_period": "TTM ending 2026-06-30",
+      "annual_earnings": 10,
+      "source_ids": [
+        "demo"
+      ],
+      "periods": [
+        {
+          "period": "2026Q1",
+          "start": "2026-01-01",
+          "end": "2026-03-31",
+          "prior_start": "2025-01-01",
+          "prior_end": "2025-03-31",
+          "actual": true,
+          "comparable": true,
+          "profit": 2.5,
+          "prior_profit": 2.5,
+          "source_ids": [
+            "demo"
+          ]
+        },
+        {
+          "period": "2026Q2",
+          "start": "2026-04-01",
+          "end": "2026-06-30",
+          "prior_start": "2025-04-01",
+          "prior_end": "2025-06-30",
+          "actual": true,
+          "comparable": true,
+          "profit": 2.5,
+          "prior_profit": 2.5,
+          "source_ids": [
+            "demo"
+          ]
+        }
+      ],
+      "cash_flow": {
+        "actual": true,
+        "revenue": 100,
+        "nopat": 10,
+        "da": 5,
+        "capex": 5,
+        "change_nwc": 0,
+        "fcff": 10,
+        "source_ids": [
+          "demo"
+        ]
+      }
+    },
+    "claims": [],
+    "decision": {
+      "action": "wait",
+      "model_paths": [
+        "/montecarlo"
+      ]
+    },
+    "montecarlo_distribution": {
+      "status": "supported",
+      "use": "decision",
+      "rationale": "Synthetic illustration: a clipped growth distribution and triangular cash margin reflect the assumed operating range.",
+      "counterevidence": "Synthetic illustration: renewals and cash conversion may deteriorate together, contrary to independent sampling.",
+      "review_date": "2026-10-31",
+      "falsifier": "Review if collections, growth dispersion or competitive renewals leave the specified range.",
+      "benchmark": {
+        "description": "Synthetic zero-growth cash margin range 5%-10% is a conservative comparator; actual cash margin is 10%.",
+        "limitations": "Illustrative inputs only; no empirical percentile dataset.",
+        "percentile": null,
+        "source_ids": [
+          "demo"
+        ],
+        "industry": "software",
+        "scale": "small revenue cohort",
+        "business_model": "subscription",
+        "stage": "scaling",
+        "order_visibility": "contract backlog and cash receipts"
+      },
+      "evidence": {
+        "business": [
+          {
+            "observation": "Synthetic contracted renewals support the stated revenue path and repricing.",
+            "source_ids": [
+              "demo"
+            ]
+          }
+        ],
+        "cash_flow": [
+          {
+            "observation": "Synthetic collection and investment records support the stated FCFF path after all capital expenditure.",
+            "source_ids": [
+              "demo"
+            ]
+          }
+        ],
+        "competition": [
+          {
+            "observation": "Synthetic renewal observations show stable customer share after the assumed repricing.",
+            "source_ids": [
+              "demo"
+            ]
+          }
+        ]
+      },
+      "assumed_spec": {
+        "base_revenue": 100,
+        "growth_mean": 0.04,
+        "growth_std": 0.02,
+        "margin_low": 0.05,
+        "margin_mode": 0.1,
+        "margin_high": 0.15,
+        "wacc_low": 0.1,
+        "wacc_high": 0.1,
+        "terminal_g": 0.0,
+        "years": 5,
+        "fade_years": 3,
+        "annual_dilution": 0.0,
+        "shares": 10,
+        "net_debt": 0,
+        "growth_distribution": "clipped_normal_3sigma",
+        "margin_distribution": "triangular",
+        "wacc_distribution": "uniform",
+        "sampling": "independent_constant_growth_and_margin"
+      },
+      "conservative_spec": {
+        "base_revenue": 100,
+        "growth_mean": 0,
+        "growth_std": 0,
+        "margin_low": 0.05,
+        "margin_mode": 0.08,
+        "margin_high": 0.1,
+        "wacc_low": 0.1,
+        "wacc_high": 0.1,
+        "terminal_g": 0.0,
+        "years": 5,
+        "fade_years": 3,
+        "annual_dilution": 0.0,
+        "shares": 10,
+        "net_debt": 0,
+        "growth_distribution": "clipped_normal_3sigma",
+        "margin_distribution": "triangular",
+        "wacc_distribution": "uniform",
+        "sampling": "independent_constant_growth_and_margin"
+      },
+      "assumed_summary": {
+        "growth_mean": 0.04,
+        "growth_low": -0.019999999999999997,
+        "growth_high": 0.1,
+        "growth_p10": 0.014368968689107985,
+        "growth_p90": 0.06563103131089201,
+        "margin_mean": 0.1,
+        "margin_low": 0.05,
+        "margin_high": 0.15,
+        "margin_p10": 0.0723606797749979,
+        "margin_p90": 0.1276393202250021,
+        "wacc_mean": 0.1,
+        "wacc_low": 0.1,
+        "wacc_high": 0.1,
+        "wacc_p10": 0.1,
+        "wacc_p90": 0.1
+      },
+      "conservative_summary": {
+        "growth_mean": 0,
+        "growth_low": 0,
+        "growth_high": 0,
+        "growth_p10": 0.0,
+        "growth_p90": 0.0,
+        "margin_mean": 0.07666666666666666,
+        "margin_low": 0.05,
+        "margin_high": 0.1,
+        "margin_p10": 0.062247448713915896,
+        "margin_p90": 0.09000000000000001,
+        "wacc_mean": 0.1,
+        "wacc_low": 0.1,
+        "wacc_high": 0.1,
+        "wacc_p10": 0.1,
+        "wacc_p90": 0.1
+      },
+      "expectation_rationale": "Synthetic revenue records support mean growth of 4%; cash conversion scenarios support mean FCFF margin of 10%.",
+      "tail_rationale": "Synthetic upside observations support an upper FCFF margin of 15% and the triangular tail weights; outcomes are possible, not certain."
+    }
+  },
+  "wacc": 0.1,
+  "terminal_g": 0.0,
+  "montecarlo": {
+    "base_revenue": 100,
+    "growth_mean": 0.04,
+    "growth_std": 0.02,
+    "margin_low": 0.05,
+    "margin_mode": 0.1,
+    "margin_high": 0.15,
+    "years": 5,
+    "fade_years": 3,
+    "wacc_low": 0.1,
+    "wacc_high": 0.1
+  },
+  "net_debt": 0
+}
