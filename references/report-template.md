@@ -1,6 +1,6 @@
-# 报告模板：九章结构（v2）
+# 完整研究报告模板：九章结构
 
-严格按以下章节顺序输出。**撰写前先读 `references/output-format.md`**（结论框/Tearsheet/本章要点/数字规范/football field 画法均在其中）。没有的数据按报告语言写"未获取到"或"Not obtained"，不要留空表头。
+仅在用户明确要求完整深度研究时按以下章节顺序输出；直接回答和专题分析不使用本模板。**撰写前先读 `references/output-format.md`**（结论框/Tearsheet/本章要点/数字规范/football field 画法均在其中）。没有的数据按报告语言写"未获取到"或"Not obtained"，不要留空表头。
 
 格式约定：标题按报告语言生成；中文用 `# 公司名（代码）个股投资研究报告`，英文用 `# Company (Ticker) Equity Research Report`。副标题标"撰写日期 / 数据截止日 / 报告币种"或英文等价 `"Report date / Data cutoff / Reporting currency"`，下一行声明 `行业附录: <主 slug>[, <次 slug>]` 或 `Industry appendix: <primary slug>[, <secondary slug>]`。A/H 标的第六章末附两地对比、第一/九章分市场结论。
 
@@ -12,7 +12,7 @@
 
 1. **结论框**（引用块）：决策三分法（内在价值判断 / 未来 1–3 个月市场交易方向 / 投资动作）+ 财报可信度等级 + 置信度 + 一句话论点 + 综合区间与隐含空间 + 最大风险。
 2. **Tearsheet 快照表**：现价/市值/52周/关键倍数/护城河/可信度/催化剂 Top1/上行证伪 Top1/下行证伪 Top1（每行来源+时间戳）。
-3. **预期差 Gap 表**（本模板的分析主线，骨架见 `expectations-investing.md`）：市场隐含 vs 我的预期 vs base rate 分位，净预期差方向。
+3. **预期差 Gap 表**（本模板的分析主线，骨架见 `expectations-investing.md`）：市场隐含 vs 我的预期 vs 可比参照及数据质量，净预期差方向。
 4. 核心多空逻辑各 3 条（精炼、可证伪）。
 
 英文报告使用同一九章结构的英文标题：Executive Summary; Business Overview; Business and Competitive Analysis; Management, Governance, and Capital Allocation; Financial Analysis and Earnings Quality; Valuation; Analyst View Summary; Recent News and Catalysts; Investment Conclusion, Counter-Case, and Position Sizing. 表格字段、缺失数据标记和免责声明同步改为英文。
@@ -26,7 +26,7 @@
 
 ## 三、业务与竞争分析
 
-行业空间与周期位置；竞争格局与份额趋势；**护城河评分表**（无形资产/转换成本/网络效应/成本优势/规模，各给 有无+强度+依据，综合判 无/窄/宽）——须与第六章 EPV/净资产、EVA 的财务验证交叉印证，不一致处显式解释；增长引擎与证伪点。
+行业空间与周期位置；竞争格局与份额趋势；**护城河评分表**（无形资产/转换成本/网络效应/成本优势/规模，各给 有无+强度+依据，综合判 无/窄/宽）——与第六章实际使用的方法及经营证据交叉核对，披露共享假设与不一致处；增长引擎与证伪点。
 
 ## 四、管理层、治理与资本配置计分卡
 
@@ -58,15 +58,9 @@
 
 ## 六、估值（多方法交叉验证）
 
-按 `valuation-methods.md` 执行，**至少三种**，顺序建议：
+按 `valuation-methods.md` 选择适用方法，不设最少数量。反向 DCF/PVGO 若适用，单列“现价隐含要求”；正向 DCF、EPV、EVA、相对估值或行业方法按数据和经济模型选用，不将共享同一恢复假设的结果计作独立证据。
 
-1. **反向 DCF + PVGO**（开篇：现价隐含什么，对照 base rates）。
-2. 三情景概率加权 DCF（+ 可选蒙特卡洛分布）。
-3. 三要素/EPV（含护城河财务验证）。
-4. EVA/剩余收益（含 g = RR×ROIIC 自洽检验）。
-5. 相对估值（合理倍数纪律）/ SOTP / 行业特定法。
-
-输出：各方法假设表（附 base rate 分位与当前证据强度）→ **估值汇总表 + 文本版 football field 图** → WACC×g 敏感性（高于现价的格加粗）→ 综合区间。三情景概率必须说明 bull/base/bear 的当前证据强度；若某个非基准情景已有中强/强证据支持，不能只作为尾部情景，除非显式解释原因。所有数字出自 `scripts/dcf.py`，假设 JSON 留档。
+输出实际方法的假设、可比参照与数据质量、共享驱动和来源 → 估值区间与关键敏感性 → 综合判断。多方法时可加 football field，反向 DCF 无价值加权。增长持续与盈利恢复按 `research-review.md` 审查；conditional 路径单列，不进入决策估值。概率没有固定证据等级下限，需说明来源和敏感性。脚本已支持模块用 `dcf.py`，其他方法另附可复算模型，假设均留档。
 
 ## 七、分析师评价汇总
 

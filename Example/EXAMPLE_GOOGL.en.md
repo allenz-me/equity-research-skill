@@ -1,5 +1,7 @@
 # Alphabet Inc. (GOOGL / NASDAQ) Equity Research Report
 
+> Historical example: this report uses an earlier methodology. Its original data and valuation have not been recalculated under the current calculation and evidence rules; it is not a current template or a validated investment conclusion.
+
 **Report date: 2026-07-24 | Data cutoff: 2026-07-23 US market close | Reporting currency: USD (amounts in $B unless otherwise stated; per-share figures in $)**
 Research mode: full deep-dive research, including the Q2 2026 earnings event | Industry appendix: Internet/platforms (primary) + SaaS (secondary, Cloud segment)
 

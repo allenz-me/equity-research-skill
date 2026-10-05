@@ -1,5 +1,7 @@
 # NVIDIA (NVDA) Equity Research Report
 
+> Historical example: this report uses an earlier methodology. Its original data and valuation have not been recalculated under the current calculation and evidence rules; it is not a current template or a validated investment conclusion.
+
 **Report date: 2026-07-17 | Data cutoff: 2026-07-17 13:16 BST | Exchange: NASDAQ | Reporting currency: USD**
 
 > This report separates facts from **my view**. Facts are cited with source and timestamp wherever possible. Model-based valuation is scenario analysis, not a deterministic result. This report is for research reference only and does not constitute personalized investment advice.
