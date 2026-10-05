@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -67,7 +68,8 @@ def load_json(path: str) -> Dict:
 
 
 def norm_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.strip().lower())
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(char for char in normalized if char.isalnum())
 
 
 def parse_number(value) -> Optional[float]:
@@ -239,11 +241,27 @@ def calibrate(price: float, lo: float, hi: float) -> str:
     return "显著高估"
 
 
-def load_csv(path: str) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+def load_csv(path: str, issues: Optional[List[Issue]] = None) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
-    aliases = {norm_key(k): k for k in (reader.fieldnames or [])}
+    aliases: Dict[str, str] = {}
+    grouped: Dict[str, List[str]] = {}
+    for header in reader.fieldnames or []:
+        grouped.setdefault(norm_key(header), []).append(header)
+    for key, headers in grouped.items():
+        if not key or len(headers) > 1:
+            if issues is not None:
+                add(
+                    issues,
+                    "P1",
+                    "FINANCIALS_AMBIGUOUS_HEADER" if key else "FINANCIALS_EMPTY_HEADER",
+                    "财务 CSV 表头重复或规范化后冲突；相关列不参与计算。" if key else "财务 CSV 含空或无法识别的表头；相关列不参与计算。",
+                    detail=f"headers={headers!r}",
+                    file=path,
+                )
+            continue
+        aliases[key] = headers[0]
     return rows, aliases
 
 
@@ -620,7 +638,7 @@ def check_forensics(rows, aliases, path, issues) -> None:
 
 
 def check_financials(path: str, issues: List[Issue]) -> None:
-    rows, aliases = load_csv(path)
+    rows, aliases = load_csv(path, issues)
     if not rows:
         add(issues, "P1", "FINANCIALS_EMPTY", "财务 CSV 没有数据行。", file=path)
         return
